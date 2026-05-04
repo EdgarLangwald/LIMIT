@@ -13,10 +13,9 @@ Result: Clustering increases and recall steadily drops with increasing loi lengt
 
 ## Other
 
-Path to LIMIT paper pdf "C:\Users\EdgarLangwald\Documents\Papers\LIMIT DeepMind.pdf"
 URL to LIMIT repo: https://github.com/google-deepmind/limit
 This Claude Code session is being run from windows powershell
-**IMPORTANT** Run all scripts from C:\Users\EdgarLangwald\Documents\Coding\.venv this venv. Also pip install into there
+**IMPORTANT** Run all scripts from the venv of the parent folder (e.g. .venv or Machine_Learning_venv). Also pip install into there
 
 ## Paper description for quick context
 

@@ -22,6 +22,7 @@ def eval_item_retrieval(
     n: int = 100,
     m: int | None = None,
     model_name: str = MODEL_NAME,
+    query_prefix: str = QUERY_PREFIX,
     batch_size: int = 64,
     single_query: bool = False,
     cache_dir:  str = _DEFAULT_CACHE_DIR,
@@ -66,7 +67,7 @@ def eval_item_retrieval(
         query_texts = [queries[q] for q in query_ids]
 
         doc_embs = embed(doc_texts,   model_name, prefix="",           cache_dir=cache_dir, models_dir=models_dir, device=device, batch_size=batch_size)
-        qry_embs = embed(query_texts, model_name, prefix=QUERY_PREFIX, cache_dir=cache_dir, models_dir=models_dir, device=device, batch_size=batch_size)
+        qry_embs = embed(query_texts, model_name, prefix=query_prefix, cache_dir=cache_dir, models_dir=models_dir, device=device, batch_size=batch_size)
 
         # (n_queries × n_docs) cosine similarity matrix
         scores = qry_embs @ doc_embs.T
@@ -222,6 +223,7 @@ def eval_retrieval_vs_n(
     n: int | None = None,
     n_values: list[int] | None = None,
     model_name: str = MODEL_NAME,
+    query_prefix: str = QUERY_PREFIX,
     batch_size: int = 64,
     cache_dir:  str = _DEFAULT_CACHE_DIR,
     models_dir: str = _DEFAULT_MODELS_DIR,
@@ -269,7 +271,7 @@ def eval_retrieval_vs_n(
         query_texts = [queries[q] for q in query_ids]
 
         doc_embs = embed(doc_texts,   model_name, prefix="",           cache_dir=cache_dir, models_dir=models_dir, device=device, batch_size=batch_size)
-        qry_embs = embed(query_texts, model_name, prefix=QUERY_PREFIX, cache_dir=cache_dir, models_dir=models_dir, device=device, batch_size=batch_size)
+        qry_embs = embed(query_texts, model_name, prefix=query_prefix, cache_dir=cache_dir, models_dir=models_dir, device=device, batch_size=batch_size)
 
         scores = qry_embs @ doc_embs.T  # (n_queries, n_docs)
 
