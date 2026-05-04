@@ -7,6 +7,7 @@ If the cache is cold and no GPU is available, SentenceTransformer will still
 run (slowly) on CPU — or you can call this from prepare_embeddings.py first.
 """
 
+import gc
 import hashlib
 import json
 import os
@@ -68,4 +69,11 @@ def embed(
     )
     embs = np.array(embs, dtype=np.float32)
     np.save(cache_path, embs)
+
+    import torch
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     return embs
