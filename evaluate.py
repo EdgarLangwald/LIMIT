@@ -10,83 +10,70 @@ Model: BAAI/bge-large-en-v1.5 — asymmetric retrieval, query-side instruction p
 import os
 import numpy as np
 import matplotlib.pyplot as plt
-from custom_dataset_creation import generate_disjoint_dataset, generate_names, generate_k_shared_dataset, _load_notebook_globals
-from embed import embed, _DEFAULT_CACHE_DIR, _DEFAULT_MODELS_DIR
+from create_datasets import build_disjoint_dataset, generate_k_shared_dataset
+from name_item_pool import load_pool
+from embed import embed, embed_dataset, get_query_prefix, _DEFAULT_CACHE_DIR, _DEFAULT_MODELS_DIR
 
 MODEL_NAME = "BAAI/bge-large-en-v1.5"
-# BGE asymmetric retrieval: queries get this prefix, documents get none
-QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 
 
 def eval_item_retrieval(
     n: int = 100,
-    m: int | None = None,
+    m_max: int | None = None,
     model_name: str = MODEL_NAME,
-    query_prefix: str = QUERY_PREFIX,
+    query_prefix: str | None = None,
     batch_size: int = 64,
-    single_query: bool = False,
     cache_dir:  str = _DEFAULT_CACHE_DIR,
     models_dir: str = _DEFAULT_MODELS_DIR,
     device:     str | None = None,
 ) -> dict[int, dict]:
     """
-    Evaluate retrieval performance for increasing list-of-items (LOI) length.
+    Evaluate retrieval recall for m = 1..m_max on the disjoint dataset.
+    Embeddings for all m values are loaded in a single pass.
 
-    Args:
-        n:          Number of persons (documents) per experiment.
-        m_values:   LOI lengths to test. Defaults to 1..18.
-        model_name: HuggingFace SentenceTransformer model.
-        batch_size: Encoding batch size.
-
-    Returns:
-        dict mapping m -> {"recall@1", "recall@5", "mrr", "n_queries"}
+    Returns dict mapping m -> {"recall@1", "recall@5", "mrr", "n_queries"}.
     """
-    if m is None:
-        pool_size = len(_load_notebook_globals()[0])
-        m = pool_size // n
+    query_prefix = query_prefix or get_query_prefix(model_name)
+    if m_max is None:
+        m_max = len(load_pool()[0]) // n
 
-    names = generate_names(n)
+    dataset = build_disjoint_dataset(n=n, m_max=m_max)
+    doc_embs, qry_embs = embed_dataset(
+        dataset, model_name, query_prefix=query_prefix,
+        cache_dir=cache_dir, models_dir=models_dir, device=device, batch_size=batch_size,
+    )
+
+    doc_ids = list(dataset["corpus"].keys())
+    qry_ids = list(dataset["queries"].keys())
+    doc_pos = {d: i for i, d in enumerate(doc_ids)}
+    qry_pos = {q: i for i, q in enumerate(qry_ids)}
+    qrels   = dataset["qrels"]
+
     results: dict[int, dict] = {}
-
     print(f"Model : {model_name}")
     print(f"n     : {n} documents")
     print(f"{'m':>4}  {'recall@1':>9}  {'recall@5':>9}  {'mrr':>7}  queries")
     print("-" * 50)
 
-    for m in range(1, m + 1):
-        dataset = generate_disjoint_dataset(n=n, m=m, names=names, single_query=single_query)
-        corpus  = dataset["corpus"]   # {name: "Name likes ..."}
-        queries = dataset["queries"]  # {qid: "Who likes X?"}
-        qrels   = dataset["qrels"]    # {qid: {name: 1}}
+    for m in range(1, m_max + 1):
+        prefix = f"m{m}/"
+        m_qids = [q for q in qry_ids if q.startswith(prefix)]
+        m_dids = [d for d in doc_ids if d.startswith(prefix)]
 
-        doc_ids   = list(corpus.keys())
-        doc_texts = [corpus[d] for d in doc_ids]
-        doc_idx   = {d: i for i, d in enumerate(doc_ids)}
+        qi = np.array([qry_pos[q] for q in m_qids])
+        di = np.array([doc_pos[d] for d in m_dids])
+        m_doc_local = {d: j for j, d in enumerate(m_dids)}
 
-        query_ids   = list(queries.keys())
-        query_texts = [queries[q] for q in query_ids]
+        scores = qry_embs[qi] @ doc_embs[di].T
+        rel_local  = np.array([m_doc_local[next(iter(qrels[q]))] for q in m_qids])
+        rel_scores = scores[np.arange(len(m_qids)), rel_local]
+        ranks      = (scores > rel_scores[:, None]).sum(axis=1) + 1
 
-        doc_embs = embed(doc_texts,   model_name, prefix="",           cache_dir=cache_dir, models_dir=models_dir, device=device, batch_size=batch_size)
-        qry_embs = embed(query_texts, model_name, prefix=query_prefix, cache_dir=cache_dir, models_dir=models_dir, device=device, batch_size=batch_size)
-
-        # (n_queries × n_docs) cosine similarity matrix
-        scores = qry_embs @ doc_embs.T
-
-        rel_indices = np.array(
-            [doc_idx[next(iter(qrels[qid]))] for qid in query_ids]
-        )
-        # rank of the relevant doc = number of docs that scored strictly higher + 1
-        rel_scores = scores[np.arange(len(query_ids)), rel_indices]
-        ranks = (scores > rel_scores[:, None]).sum(axis=1) + 1  # (n_queries,)
-
-        total = len(query_ids)
-        r1      = float(np.mean(ranks == 1))
-        r5      = float(np.mean(ranks <= 5))
-        mrr_sum = float(np.sum(1.0 / ranks))
+        total = len(m_qids)
         results[m] = {
-            "recall@1": r1,
-            "recall@5": r5,
-            "mrr":      mrr_sum / total,
+            "recall@1":  float(np.mean(ranks == 1)),
+            "recall@5":  float(np.mean(ranks <= 5)),
+            "mrr":       float(np.mean(1.0 / ranks)),
             "n_queries": total,
         }
         r = results[m]
@@ -97,7 +84,7 @@ def eval_item_retrieval(
 
 def eval_embed_distance(
     n: int = 100,
-    m: int | None = None,
+    m_max: int | None = None,
     k: int = 5,
     model_name: str = MODEL_NAME,
     batch_size: int = 64,
@@ -117,42 +104,39 @@ def eval_embed_distance(
                       Higher values mean embeddings are concentrated in a narrow cone
                       rather than spread across the sphere.
     """
-    if m is None:
-        pool_size = len(_load_notebook_globals()[0])
-        m = pool_size // n
+    if m_max is None:
+        m_max = len(load_pool()[0]) // n
 
-    names = generate_names(n)
+    dataset = build_disjoint_dataset(n=n, m_max=m_max)
+    doc_ids   = list(dataset["corpus"].keys())
+    doc_texts = [dataset["corpus"][d] for d in doc_ids]
+    doc_pos   = {d: i for i, d in enumerate(doc_ids)}
+
+    embs = embed(doc_texts, model_name, prefix="", cache_dir=cache_dir, models_dir=models_dir, device=device, batch_size=batch_size)
+
     results: dict[int, dict] = {}
-
     print(f"Model : {model_name}")
     print(f"n     : {n} documents  |  k = {k}")
     print(f"{'m':>4}  {'mean_nn_dist':>13}  {'topk_gap':>10}  {'anisotropy':>11}")
     print("-" * 48)
 
-    for m in range(1, m + 1):
-        dataset = generate_disjoint_dataset(n=n, m=m, names=names)
-        doc_texts = list(dataset["corpus"].values())
+    for m in range(1, m_max + 1):
+        prefix  = f"m{m}/"
+        m_dids  = [d for d in doc_ids if d.startswith(prefix)]
+        di      = np.array([doc_pos[d] for d in m_dids])
+        m_embs  = embs[di]  # (n, d), unit vectors
+        n_m     = len(m_dids)
 
-        embs = embed(doc_texts, model_name, prefix="", cache_dir=cache_dir, models_dir=models_dir, device=device, batch_size=batch_size)
-        # (n, d), unit vectors
+        cos_sim = m_embs @ m_embs.T  # (n_m, n_m)
+        dists   = np.sqrt(np.clip(2.0 - 2.0 * cos_sim, 0.0, None))
 
-        # Cosine similarity via dot product (embeddings are already normalised)
-        cos_sim = embs @ embs.T  # (n, n)
-
-        # Euclidean distance on the unit sphere: sqrt(2 - 2·cos)
-        dists = np.sqrt(np.clip(2.0 - 2.0 * cos_sim, 0.0, None))
-
-        # Exclude self-distance from neighbour statistics
         np.fill_diagonal(dists, np.inf)
-        sorted_dists = np.sort(dists, axis=1)  # ascending; col 0 = nearest neighbour
+        sorted_dists = np.sort(dists, axis=1)
 
         mean_nn_dist = float(sorted_dists[:, 0].mean())
-        # gap between rank-k and rank-(k+1) neighbour (0-indexed: cols k-1 and k)
-        topk_gap = float(np.mean(sorted_dists[:, k] - sorted_dists[:, k - 1]))
-
-        # Anisotropy: average off-diagonal cosine similarity
-        off_diag = cos_sim[~np.eye(n, dtype=bool)]
-        anisotropy = float(off_diag.mean())
+        topk_gap     = float(np.mean(sorted_dists[:, k] - sorted_dists[:, k - 1]))
+        off_diag     = cos_sim[~np.eye(n_m, dtype=bool)]
+        anisotropy   = float(off_diag.mean())
 
         results[m] = {
             "mean_nn_dist": mean_nn_dist,
@@ -223,7 +207,7 @@ def eval_retrieval_vs_n(
     n: int | None = None,
     n_values: list[int] | None = None,
     model_name: str = MODEL_NAME,
-    query_prefix: str = QUERY_PREFIX,
+    query_prefix: str | None = None,
     batch_size: int = 64,
     cache_dir:  str = _DEFAULT_CACHE_DIR,
     models_dir: str = _DEFAULT_MODELS_DIR,
@@ -241,7 +225,9 @@ def eval_retrieval_vs_n(
       recall@k  — fraction of relevant docs in top-k
       mrr       — 1 / rank of the highest-ranked relevant doc
     """
-    pool_size = len(_load_notebook_globals()[0])
+    query_prefix = query_prefix or get_query_prefix(model_name)
+
+    pool_size = len(load_pool()[0])
 
     if n_values is not None:
         sweep = n_values
@@ -317,7 +303,7 @@ def plot_retrieval_vs_n(results: dict[int, dict], m: int, k: int) -> None:
 
 if __name__ == "__main__":
     n = 50
-    pool_size = len(_load_notebook_globals()[0])
+    pool_size = len(load_pool()[0])
     print(f"Item pool size: {pool_size}, max m for n={n}: {pool_size // n}")
 
     dist_results = eval_embed_distance(n=n)

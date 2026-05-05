@@ -1,7 +1,9 @@
 /models
+/data
 /retrieval_k_2.png
 /retrieval_n_100.png
 /retrieval_n_50.png
 /__pycache__
 /.env
 *.pdf
+\!!!_start-claude.bat

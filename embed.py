@@ -4,7 +4,7 @@ Embedding with transparent disk cache.
 On a GPU machine / cluster: embeddings are computed and saved to cache_dir.
 On a CPU machine:           cached .npy files are loaded directly.
 If the cache is cold and no GPU is available, SentenceTransformer will still
-run (slowly) on CPU — or you can call this from prepare_embeddings.py first.
+run (slowly) on CPU — or pre-compute with main.py first.
 """
 
 import gc
@@ -17,6 +17,50 @@ import numpy as np
 
 _DEFAULT_CACHE_DIR  = os.path.join(os.path.dirname(__file__), "embeddings")
 _DEFAULT_MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
+
+# Query-side instruction prefixes, keyed by HuggingFace model ID.
+# Documents are always embedded without a prefix.
+QUERY_PREFIXES: dict[str, str] = {
+    "BAAI/bge-large-en-v1.5":              "Represent this sentence for searching relevant passages: ",
+    "intfloat/e5-mistral-7b-instruct":     "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: ",
+    "Snowflake/snowflake-arctic-embed-l":  "Represent this sentence for searching relevant passages: ",
+}
+
+
+def get_query_prefix(model_name: str) -> str:
+    """Return the query-side instruction prefix for model_name, or '' if none needed."""
+    return QUERY_PREFIXES.get(model_name, "")
+
+
+def embed_dataset(
+    dataset: dict,
+    model_name: str,
+    query_prefix: str = "",
+    cache_dir:  str = _DEFAULT_CACHE_DIR,
+    models_dir: str = _DEFAULT_MODELS_DIR,
+    device:     str | None = None,
+    batch_size: int = 64,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Embed corpus and queries from a standard dataset dict.
+
+    Args:
+        dataset:      dict with keys "corpus" ({id: text}) and "queries" ({id: text}).
+        query_prefix: Prepended to every query text (model-specific instruction).
+                      Use get_query_prefix(model_name) to look it up automatically.
+
+    Returns:
+        (doc_embs, query_embs) — shapes (n_docs, d) and (n_queries, d), float32.
+    """
+    doc_embs = embed(
+        list(dataset["corpus"].values()), model_name, prefix="",
+        cache_dir=cache_dir, models_dir=models_dir, device=device, batch_size=batch_size,
+    )
+    qry_embs = embed(
+        list(dataset["queries"].values()), model_name, prefix=query_prefix,
+        cache_dir=cache_dir, models_dir=models_dir, device=device, batch_size=batch_size,
+    )
+    return doc_embs, qry_embs
 
 
 def embed(
