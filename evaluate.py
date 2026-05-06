@@ -1,83 +1,90 @@
-"""
-Evaluates item retrieval on the disjoint LIMIT-style dataset.
-
-For each m (LOI length), generates n=100 persons each liking m disjoint items,
-then tests whether an embedding model can answer "Who likes X?" by cosine similarity.
-
-Model: BAAI/bge-large-en-v1.5 — asymmetric retrieval, query-side instruction prefix.
-"""
-
-import os
 import numpy as np
 import matplotlib.pyplot as plt
-from create_datasets import build_disjoint_dataset, generate_k_shared_dataset
+from create_datasets import build_disjoint_dataset
 from name_item_pool import load_pool
 from embed import embed, embed_dataset, get_query_prefix, _DEFAULT_CACHE_DIR, _DEFAULT_MODELS_DIR
 
 MODEL_NAME = "BAAI/bge-large-en-v1.5"
 
 
-def eval_item_retrieval(
-    n: int = 100,
-    m_max: int | None = None,
-    model_name: str = MODEL_NAME,
-    query_prefix: str | None = None,
-    batch_size: int = 64,
-    cache_dir:  str = _DEFAULT_CACHE_DIR,
-    models_dir: str = _DEFAULT_MODELS_DIR,
-    device:     str | None = None,
-) -> dict[int, dict]:
+def retrieval_metrics(
+    scores: np.ndarray,
+    relevant_indices: list[list[int]],
+    ks: list[int] = [1, 5],
+) -> dict[str, float]:
     """
-    Evaluate retrieval recall for m = 1..m_max on the disjoint dataset.
-    Embeddings for all m values are loaded in a single pass.
-
-    Returns dict mapping m -> {"recall@1", "recall@5", "mrr", "n_queries"}.
+    scores:           (n_queries, n_docs) cosine similarity matrix
+    relevant_indices: per-query list of relevant doc column indices
+    Returns recall@k for each k in ks, plus mrr.
     """
-    query_prefix = query_prefix or get_query_prefix(model_name)
-    if m_max is None:
-        m_max = len(load_pool()[0]) // n
+    recall_hits = {k: [] for k in ks}
+    mrr_vals = []
+    for qi, rel in enumerate(relevant_indices):
+        row = scores[qi]
+        rel_scores = row[np.array(rel)]
+        ranks = (row[None, :] > rel_scores[:, None]).sum(axis=1) + 1
+        mrr_vals.append(float(1.0 / ranks.min()))
+        for k in ks:
+            recall_hits[k].append(float((ranks <= k).mean()))
+    out = {f"recall@{k}": float(np.mean(recall_hits[k])) for k in ks}
+    out["mrr"] = float(np.mean(mrr_vals))
+    return out
 
-    dataset = build_disjoint_dataset(n=n, m_max=m_max)
-    doc_embs, qry_embs = embed_dataset(
-        dataset, model_name, query_prefix=query_prefix,
-        cache_dir=cache_dir, models_dir=models_dir, device=device, batch_size=batch_size,
-    )
 
-    doc_ids = list(dataset["corpus"].keys())
-    qry_ids = list(dataset["queries"].keys())
-    doc_pos = {d: i for i, d in enumerate(doc_ids)}
-    qry_pos = {q: i for i, q in enumerate(qry_ids)}
-    qrels   = dataset["qrels"]
+def evaluate(
+    mapping_or_list,
+    qrels_or_list,
+    recall_at: list[int] = [1, 5],
+    n_values: list[int] | None = None,
+) -> list[dict]:
+    """
+    Compute retrieval metrics from structured mappings returned by embed_dataset.
 
-    results: dict[int, dict] = {}
-    print(f"Model : {model_name}")
-    print(f"n     : {n} documents")
-    print(f"{'m':>4}  {'recall@1':>9}  {'recall@5':>9}  {'mrr':>7}  queries")
-    print("-" * 50)
+    mapping_or_list: {"docs": {id: emb}, "queries": {id: emb}} or a list of these
+    qrels_or_list:   matching {query_id: {doc_id: 1}} or list of these
+    recall_at:       recall cutoffs
+    n_values:        if provided, evaluate at each corpus size by restricting to the
+                     first n doc IDs (shuffled by embed_dataset) and filtering to
+                     queries whose relevant docs are all within that prefix.
+                     Each list element is then a dict keyed by n instead of a flat metrics dict.
 
-    for m in range(1, m_max + 1):
-        prefix = f"m{m}/"
-        m_qids = [q for q in qry_ids if q.startswith(prefix)]
-        m_dids = [d for d in doc_ids if d.startswith(prefix)]
+    Returns a list parallel to the input.
+    """
+    mappings   = [mapping_or_list] if isinstance(mapping_or_list, dict) else mapping_or_list
+    qrels_list = [qrels_or_list]   if isinstance(qrels_or_list,   dict) else qrels_or_list
 
-        qi = np.array([qry_pos[q] for q in m_qids])
-        di = np.array([doc_pos[d] for d in m_dids])
-        m_doc_local = {d: j for j, d in enumerate(m_dids)}
+    results = []
+    for mapping, qrels in zip(mappings, qrels_list):
+        doc_ids   = list(mapping["docs"].keys())        # ["John Smith", "Betty Rose", ...]
+        query_ids = list(mapping["queries"].keys())     # ["query_31", "query_14", ...]
 
-        scores = qry_embs[qi] @ doc_embs[di].T
-        rel_local  = np.array([m_doc_local[next(iter(qrels[q]))] for q in m_qids])
-        rel_scores = scores[np.arange(len(m_qids)), rel_local]
-        ranks      = (scores > rel_scores[:, None]).sum(axis=1) + 1
+        doc_embs    = np.stack([mapping["docs"][d]    for d in doc_ids])
+        qry_embs    = np.stack([mapping["queries"][q] for q in query_ids])
+        scores_full = qry_embs @ doc_embs.T           # (n_queries, n_docs)
 
-        total = len(m_qids)
-        results[m] = {
-            "recall@1":  float(np.mean(ranks == 1)),
-            "recall@5":  float(np.mean(ranks <= 5)),
-            "mrr":       float(np.mean(1.0 / ranks)),
-            "n_queries": total,
-        }
-        r = results[m]
-        print(f"{m:>4}  {r['recall@1']:>9.3f}  {r['recall@5']:>9.3f}  {r['mrr']:>7.3f}  {total}")
+        if n_values is None:
+            doc_pos = {d: i for i, d in enumerate(doc_ids)}                 # {"John Smith": 0, "Betty Rose": 1, ...}
+            rel_idx = [[doc_pos[d] for d in qrels[q]] for q in query_ids]   # qrels["query_31"] = {"Alice Jones": 1} <- or multiple
+                                                                            # rel_idx[0] = [doc_pos[d] for d in {"Alice Jones": 1}] = [254]
+            r = retrieval_metrics(scores_full, rel_idx, recall_at)
+            r["n_queries"] = len(query_ids)
+            results.append(r)
+        else:
+            qry_pos   = {q: i for i, q in enumerate(query_ids)}
+            n_results = {}
+            for n in sorted(n_values):
+                subset_ids = set(doc_ids[:n])
+                subset_pos = {d: i for i, d in enumerate(doc_ids[:n])}
+                valid_qids = [q for q in query_ids if all(d in subset_ids for d in qrels[q])]
+                if not valid_qids:
+                    continue
+                qi_rows    = np.array([qry_pos[q] for q in valid_qids])
+                scores_sub = scores_full[qi_rows, :n]
+                rel_idx    = [[subset_pos[d] for d in qrels[q]] for q in valid_qids]
+                r = retrieval_metrics(scores_sub, rel_idx, recall_at)
+                r["n_queries"] = len(valid_qids)
+                n_results[n]   = r
+            results.append(n_results)
 
     return results
 
@@ -107,207 +114,67 @@ def eval_embed_distance(
     if m_max is None:
         m_max = len(load_pool()[0]) // n
 
-    dataset = build_disjoint_dataset(n=n, m_max=m_max)
-    doc_ids   = list(dataset["corpus"].keys())
-    doc_texts = [dataset["corpus"][d] for d in doc_ids]
-    doc_pos   = {d: i for i, d in enumerate(doc_ids)}
+    datasets, _, meta = build_disjoint_dataset(n=n, m_max=m_max)
+    mappings = embed_dataset(datasets, model_name, name=f"disjoint_n{n}", meta=meta, cache=True, cache_dir=cache_dir, models_dir=models_dir, device=device, batch_size=batch_size)
 
-    embs = embed(doc_texts, model_name, prefix="", cache_dir=cache_dir, models_dir=models_dir, device=device, batch_size=batch_size)
-
-    results: dict[int, dict] = {}
     print(f"Model : {model_name}")
     print(f"n     : {n} documents  |  k = {k}")
     print(f"{'m':>4}  {'mean_nn_dist':>13}  {'topk_gap':>10}  {'anisotropy':>11}")
     print("-" * 48)
 
-    for m in range(1, m_max + 1):
-        prefix  = f"m{m}/"
-        m_dids  = [d for d in doc_ids if d.startswith(prefix)]
-        di      = np.array([doc_pos[d] for d in m_dids])
-        m_embs  = embs[di]  # (n, d), unit vectors
-        n_m     = len(m_dids)
+    results: dict[int, dict] = {}
+    for m, mapping in zip(meta, mappings):
+        doc_ids = list(mapping["docs"].keys())
+        m_embs  = np.stack([mapping["docs"][d] for d in doc_ids])
+        n_m     = len(doc_ids)
 
-        cos_sim = m_embs @ m_embs.T  # (n_m, n_m)
+        cos_sim = m_embs @ m_embs.T
         dists   = np.sqrt(np.clip(2.0 - 2.0 * cos_sim, 0.0, None))
-
         np.fill_diagonal(dists, np.inf)
         sorted_dists = np.sort(dists, axis=1)
 
         mean_nn_dist = float(sorted_dists[:, 0].mean())
         topk_gap     = float(np.mean(sorted_dists[:, k] - sorted_dists[:, k - 1]))
-        off_diag     = cos_sim[~np.eye(n_m, dtype=bool)]
-        anisotropy   = float(off_diag.mean())
+        anisotropy   = float(cos_sim[~np.eye(n_m, dtype=bool)].mean())
 
-        results[m] = {
-            "mean_nn_dist": mean_nn_dist,
-            "topk_gap": topk_gap,
-            "anisotropy": anisotropy,
-        }
+        results[m] = {"mean_nn_dist": mean_nn_dist, "topk_gap": topk_gap, "anisotropy": anisotropy}
         r = results[m]
         print(f"{m:>4}  {r['mean_nn_dist']:>13.4f}  {r['topk_gap']:>10.4f}  {r['anisotropy']:>11.4f}")
 
     return results
 
 
+def plot_results(results: list[dict], meta: list) -> None:
+    ks  = sorted(int(k.split("@")[1]) for k in results[0] if k.startswith("recall@"))
+    mrr = [r["mrr"] for r in results]
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for i, k in enumerate(ks):
+        ax.plot(meta, [r[f"recall@{k}"] for r in results], marker="os^Dv"[i % 5], label=f"Recall@{k}")
+    ax.plot(meta, mrr, marker="x", linestyle="--", label="MRR")
+    ax.set_xlabel("parameter")
+    ax.set_ylabel("Score")
+    ax.set_xticks(meta)
+    ax.set_ylim(0, 1.05)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
 def plot_embed_distance(results: dict[int, dict]) -> None:
-    ms           = sorted(results)
-    mean_nn      = [results[m]["mean_nn_dist"] for m in ms]
-    topk_gap     = [results[m]["topk_gap"]     for m in ms]
-    anisotropy   = [results[m]["anisotropy"]   for m in ms]
+    ms         = sorted(results)
+    mean_nn    = [results[m]["mean_nn_dist"] for m in ms]
+    topk_gap   = [results[m]["topk_gap"]     for m in ms]
+    anisotropy = [results[m]["anisotropy"]   for m in ms]
 
     fig, axes = plt.subplots(1, 3, figsize=(14, 4))
-
-    axes[0].plot(ms, mean_nn, marker="o", color="steelblue")
-    axes[0].set_title("Mean nearest-neighbour distance")
-    axes[0].set_xlabel("m (items per person)")
-    axes[0].set_ylabel("Euclidean distance")
-
-    axes[1].plot(ms, topk_gap, marker="s", color="darkorange")
-    axes[1].set_title("Top-k gap (rank k vs k+1)")
-    axes[1].set_xlabel("m (items per person)")
-    axes[1].set_ylabel("Distance gap")
-
-    axes[2].plot(ms, anisotropy, marker="^", color="seagreen")
-    axes[2].set_title("Anisotropy (avg pairwise cos-sim)")
-    axes[2].set_xlabel("m (items per person)")
-    axes[2].set_ylabel("Cosine similarity")
-
+    axes[0].plot(ms, mean_nn,    marker="o", color="steelblue");  axes[0].set_title("Mean nearest-neighbour distance");   axes[0].set_ylabel("Euclidean distance")
+    axes[1].plot(ms, topk_gap,   marker="s", color="darkorange"); axes[1].set_title("Top-k gap (rank k vs k+1)");          axes[1].set_ylabel("Distance gap")
+    axes[2].plot(ms, anisotropy, marker="^", color="seagreen");   axes[2].set_title("Anisotropy (avg pairwise cos-sim)");  axes[2].set_ylabel("Cosine similarity")
     for ax in axes:
+        ax.set_xlabel("m (items per person)")
         ax.set_xticks(ms)
         ax.grid(True, alpha=0.3)
-
     plt.tight_layout()
     plt.show()
-
-
-def plot_results(results: dict[int, dict]) -> None:
-    ms      = sorted(results)
-    r1      = [results[m]["recall@1"] for m in ms]
-    r5      = [results[m]["recall@5"] for m in ms]
-    mrr     = [results[m]["mrr"]      for m in ms]
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(ms, r1,  marker="o", label="Recall@1")
-    ax.plot(ms, r5,  marker="s", label="Recall@5")
-    ax.plot(ms, mrr, marker="^", label="MRR")
-    ax.set_xlabel("m (items per person)")
-    ax.set_ylabel("Score")
-    ax.set_title("Item retrieval performance vs. LOI length")
-    ax.set_xticks(ms)
-    ax.set_ylim(0, 1.05)
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.show()
-
-
-def eval_retrieval_vs_n(
-    m: int = 3,
-    k: int = 2,
-    n: int | None = None,
-    n_values: list[int] | None = None,
-    model_name: str = MODEL_NAME,
-    query_prefix: str | None = None,
-    batch_size: int = 64,
-    cache_dir:  str = _DEFAULT_CACHE_DIR,
-    models_dir: str = _DEFAULT_MODELS_DIR,
-    device:     str | None = None,
-) -> dict[int, dict]:
-    """
-    Evaluate retrieval performance for increasing corpus size, with fixed m and k.
-
-    If n_values is provided, evaluates exactly those n values.
-    Otherwise sweeps all even n from n_min to n (inclusive), where n defaults to
-    the maximum the item pool allows: pool_size * k // m floored to even.
-
-    Metrics per query:
-      recall@1  — fraction of relevant docs at rank 1
-      recall@k  — fraction of relevant docs in top-k
-      mrr       — 1 / rank of the highest-ranked relevant doc
-    """
-    query_prefix = query_prefix or get_query_prefix(model_name)
-
-    pool_size = len(load_pool()[0])
-
-    if n_values is not None:
-        sweep = n_values
-    else:
-        if n is None:
-            n = (pool_size * k // m) // 2 * 2
-        n_min = (m // 2 + 1) * 2
-        sweep = range(n_min, n + 1, 2)
-
-    results: dict[int, dict] = {}
-    print(f"Model : {model_name}")
-    print(f"m={m}, k={k}")
-    print(f"{'n':>6}  {'recall@2':>9}  {'recall@5':>9}  {'recall@10':>10}  queries")
-    print("-" * 52)
-
-    for n in sweep:
-        dataset = generate_k_shared_dataset(n=n, m=m, k=k)
-        corpus    = dataset["corpus"]
-        queries   = dataset["queries"]
-        qrels     = dataset["qrels"]
-
-        doc_ids   = list(corpus.keys())
-        doc_texts = [corpus[d] for d in doc_ids]
-        doc_idx   = {d: i for i, d in enumerate(doc_ids)}
-
-        query_ids   = list(queries.keys())
-        query_texts = [queries[q] for q in query_ids]
-
-        doc_embs = embed(doc_texts,   model_name, prefix="",           cache_dir=cache_dir, models_dir=models_dir, device=device, batch_size=batch_size)
-        qry_embs = embed(query_texts, model_name, prefix=query_prefix, cache_dir=cache_dir, models_dir=models_dir, device=device, batch_size=batch_size)
-
-        scores = qry_embs @ doc_embs.T  # (n_queries, n_docs)
-
-        r2_hits, r5_hits, r10_hits = [], [], []
-        for qi, qid in enumerate(query_ids):
-            rel_idxs = [doc_idx[name] for name in qrels[qid]]
-            rel_scores = scores[qi, rel_idxs]
-            ranks = np.array([(scores[qi] > s).sum() + 1 for s in rel_scores])
-            n_rel = len(rel_idxs)
-            r2_hits.append((ranks <= 2).sum() / n_rel)
-            r5_hits.append((ranks <= 5).sum() / n_rel)
-            r10_hits.append((ranks <= 10).sum() / n_rel)
-
-        total = len(query_ids)
-        r2  = float(np.mean(r2_hits))
-        r5  = float(np.mean(r5_hits))
-        r10 = float(np.mean(r10_hits))
-        results[n] = {"recall@2": r2, "recall@5": r5, "recall@10": r10, "n_queries": total}
-        print(f"{n:>6}  {r2:>9.3f}  {r5:>9.3f}  {r10:>10.3f}  {total}")
-
-    return results
-
-
-def plot_retrieval_vs_n(results: dict[int, dict], m: int, k: int) -> None:
-    ns  = sorted(results)
-    r2  = [results[n]["recall@2"]  for n in ns]
-    r5  = [results[n]["recall@5"]  for n in ns]
-    r10 = [results[n]["recall@10"] for n in ns]
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(ns, r2,  marker="o", label="Recall@2  (both in top-2)")
-    ax.plot(ns, r5,  marker="s", label="Recall@5  (both in top-5)")
-    ax.plot(ns, r10, marker="^", label="Recall@10 (both in top-10)")
-    ax.set_xlabel("n (corpus size)")
-    ax.set_ylabel("Score")
-    ax.set_title(f"Retrieval vs corpus size  (m={m}, k={k})")
-    ax.set_ylim(0, 1.05)
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.show()
-
-
-if __name__ == "__main__":
-    n = 50
-    pool_size = len(load_pool()[0])
-    print(f"Item pool size: {pool_size}, max m for n={n}: {pool_size // n}")
-
-    dist_results = eval_embed_distance(n=n)
-    plot_embed_distance(dist_results)
-
-    retrieval_results = eval_item_retrieval(n=n)
-    plot_results(retrieval_results)

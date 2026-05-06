@@ -1,10 +1,10 @@
 """
-Embedding with transparent disk cache.
+Embedding with structured per-dataset cache.
 
-On a GPU machine / cluster: embeddings are computed and saved to cache_dir.
-On a CPU machine:           cached .npy files are loaded directly.
-If the cache is cold and no GPU is available, SentenceTransformer will still
-run (slowly) on CPU — or pre-compute with main.py first.
+Cache layout:  embeddings/{experiment_name}/{model_slug}/{file}.npz
+Each .npz contains doc_ids, query_ids, doc_embs, qry_embs for one dataset.
+Doc ordering is shuffled with a fixed seed so any doc_ids[:n] prefix is a
+random-looking sample from the full dataset — required for the n_values sweep.
 """
 
 import gc
@@ -18,8 +18,6 @@ import numpy as np
 _DEFAULT_CACHE_DIR  = os.path.join(os.path.dirname(__file__), "embeddings")
 _DEFAULT_MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
 
-# Query-side instruction prefixes, keyed by HuggingFace model ID.
-# Documents are always embedded without a prefix.
 QUERY_PREFIXES: dict[str, str] = {
     "BAAI/bge-large-en-v1.5":              "Represent this sentence for searching relevant passages: ",
     "intfloat/e5-mistral-7b-instruct":     "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: ",
@@ -28,71 +26,121 @@ QUERY_PREFIXES: dict[str, str] = {
 
 
 def get_query_prefix(model_name: str) -> str:
-    """Return the query-side instruction prefix for model_name, or '' if none needed."""
     return QUERY_PREFIXES.get(model_name, "")
 
 
 def embed_dataset(
-    dataset: dict,
+    dataset_or_list,
     model_name: str,
-    query_prefix: str = "",
+    name: str,
+    cache: bool = True,
+    meta: list | None = None,
+    query_prefix: str | None = None,
+    batch_size: int = 64,
     cache_dir:  str = _DEFAULT_CACHE_DIR,
     models_dir: str = _DEFAULT_MODELS_DIR,
     device:     str | None = None,
-    batch_size: int = 64,
-) -> tuple[np.ndarray, np.ndarray]:
+    seed: int = 42,
+) -> dict | list[dict]:
     """
-    Embed corpus and queries from a standard dataset dict.
+    Embed one dataset or a list of datasets, returning structured mappings.
 
-    Args:
-        dataset:      dict with keys "corpus" ({id: text}) and "queries" ({id: text}).
-        query_prefix: Prepended to every query text (model-specific instruction).
-                      Use get_query_prefix(model_name) to look it up automatically.
+    Each mapping is {"docs": {id: emb}, "queries": {id: emb}}.
+    Doc ordering is shuffled (seed) before caching so doc_ids[:n] looks like
+    a random sample — consistent between cache loads and fresh computation.
 
-    Returns:
-        (doc_embs, query_embs) — shapes (n_docs, d) and (n_queries, d), float32.
+    Cache: {cache_dir}/{name}/{model_slug}/{fname}.npz per dataset.
+    For a list, fnames come from meta (e.g. [1,2,...,m_max] → "1.npz", "2.npz").
     """
-    doc_embs = embed(
-        list(dataset["corpus"].values()), model_name, prefix="",
-        cache_dir=cache_dir, models_dir=models_dir, device=device, batch_size=batch_size,
-    )
-    qry_embs = embed(
-        list(dataset["queries"].values()), model_name, prefix=query_prefix,
-        cache_dir=cache_dir, models_dir=models_dir, device=device, batch_size=batch_size,
-    )
-    return doc_embs, qry_embs
+    single   = isinstance(dataset_or_list, dict)
+    datasets = [dataset_or_list] if single else dataset_or_list
+    query_prefix = query_prefix or get_query_prefix(model_name)
+    model_slug   = model_name.replace("/", "_")
+    file_names   = [name] if single else [str(m) for m in (meta or range(len(datasets)))]
+
+    folder = os.path.join(cache_dir, name, model_slug)
+    if cache:
+        os.makedirs(folder, exist_ok=True)
+
+    # Load cached results where available; mark the rest for computation
+    loaded  = [None] * len(datasets)
+    missing = []
+    for i, fname in enumerate(file_names):
+        path = os.path.join(folder, f"{fname}.npz")
+        if cache and os.path.exists(path):
+            data = np.load(path, allow_pickle=True)
+            loaded[i] = {
+                "doc_ids":   list(data["doc_ids"]),
+                "query_ids": list(data["query_ids"]),
+                "doc_embs":  data["doc_embs"],
+                "qry_embs":  data["qry_embs"],
+            }
+        else:
+            missing.append(i)
+
+    # Embed all missing datasets in one pass
+    if missing:
+        missing_ds    = [datasets[i] for i in missing]
+        all_doc_texts = list({t for ds in missing_ds for t in ds["corpus"].values()})
+        all_qry_texts = list({t for ds in missing_ds for t in ds["queries"].values()})
+
+        doc_embs_all = embed(all_doc_texts, model_name, prefix="",           cache_dir=None, models_dir=models_dir, device=device, batch_size=batch_size)
+        qry_embs_all = embed(all_qry_texts, model_name, prefix=query_prefix, cache_dir=None, models_dir=models_dir, device=device, batch_size=batch_size)
+
+        text_to_doc = {t: doc_embs_all[j] for j, t in enumerate(all_doc_texts)}
+        text_to_qry = {t: qry_embs_all[j] for j, t in enumerate(all_qry_texts)}
+
+        rng = np.random.default_rng(seed)
+        for i in missing:
+            ds, fname = datasets[i], file_names[i]
+            doc_ids   = list(ds["corpus"].keys())
+            query_ids = list(ds["queries"].keys())
+            rng.shuffle(doc_ids)
+
+            d_embs = np.stack([text_to_doc[ds["corpus"][d]]  for d in doc_ids])
+            q_embs = np.stack([text_to_qry[ds["queries"][q]] for q in query_ids])
+
+            loaded[i] = {"doc_ids": doc_ids, "query_ids": query_ids, "doc_embs": d_embs, "qry_embs": q_embs}
+
+            if cache:
+                np.savez(
+                    os.path.join(folder, f"{fname}.npz"),
+                    doc_ids=np.array(doc_ids, dtype=object),
+                    query_ids=np.array(query_ids, dtype=object),
+                    doc_embs=d_embs,
+                    qry_embs=q_embs,
+                )
+
+    mappings = [
+        {
+            "docs":    {d: loaded[i]["doc_embs"][j]  for j, d in enumerate(loaded[i]["doc_ids"])},
+            "queries": {q: loaded[i]["qry_embs"][j]  for j, q in enumerate(loaded[i]["query_ids"])},
+        }
+        for i in range(len(datasets))
+    ]
+    return mappings[0] if single else mappings
 
 
 def embed(
     texts: list[str],
     model_name: str,
     prefix: str = "",
-    cache_dir:  str = _DEFAULT_CACHE_DIR,
+    cache_dir:  str | None = _DEFAULT_CACHE_DIR,
     models_dir: str = _DEFAULT_MODELS_DIR,
     device:     str | None = None,
     batch_size: int = 64,
 ) -> np.ndarray:
     """
-    Return (len(texts), d) float32 embeddings, loading from cache when available.
-
-    Args:
-        texts:      Raw texts to embed (without prefix).
-        model_name: HuggingFace model ID or local alias.
-        prefix:     Prepended to every text before encoding (e.g. BGE query prefix).
-                    Included in the cache key so doc/query caches never collide.
-        cache_dir:  Directory for .npy cache files.
-        models_dir: Directory where downloaded models are saved.
-        device:     "cuda", "cpu", or None (auto-detect).
-        batch_size: Encoding batch size.
+    Return (len(texts), d) float32 embeddings.
+    Pass cache_dir=None to skip disk caching (used internally by embed_dataset).
     """
-    os.makedirs(cache_dir, exist_ok=True)
-
-    payload = json.dumps({"model": model_name, "prefix": prefix, "texts": texts}, sort_keys=True)
-    key = hashlib.md5(payload.encode()).hexdigest()
-    cache_path = os.path.join(cache_dir, f"{key}.npy")
-
-    if os.path.exists(cache_path):
-        return np.load(cache_path)
+    cache_path = None
+    if cache_dir is not None:
+        os.makedirs(cache_dir, exist_ok=True)
+        payload    = json.dumps({"model": model_name, "prefix": prefix, "texts": texts}, sort_keys=True)
+        cache_path = os.path.join(cache_dir, f"{hashlib.md5(payload.encode()).hexdigest()}.npy")
+        if os.path.exists(cache_path):
+            return np.load(cache_path)
 
     from sentence_transformers import SentenceTransformer
 
@@ -105,14 +153,13 @@ def embed(
         model.save(local_path)
 
     prefixed = [prefix + t for t in texts] if prefix else texts
-    embs = model.encode(
-        prefixed,
-        batch_size=batch_size,
-        normalize_embeddings=True,
-        show_progress_bar=True,
+    embs = np.array(
+        model.encode(prefixed, batch_size=batch_size, normalize_embeddings=True, show_progress_bar=True),
+        dtype=np.float32,
     )
-    embs = np.array(embs, dtype=np.float32)
-    np.save(cache_path, embs)
+
+    if cache_path is not None:
+        np.save(cache_path, embs)
 
     import torch
     del model

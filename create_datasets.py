@@ -22,48 +22,35 @@ def _fmt_likes(name: str, items: list[str]) -> str:
     return f"{name} likes {', '.join(items[:-1])} and {items[-1]}."
 
 
-def build_disjoint_dataset(n: int, m_max: int | None = None, seed: int = 42) -> dict:
+def build_disjoint_dataset(n: int, m_max: int | None = None, seed: int = 42) -> tuple[list[dict], list[dict], list[int]]:
     """
-    Merge disjoint datasets for all m in 1..m_max into one embeddable dict.
-
-    IDs are namespaced as "m{m}/{original_id}" so experiments with different m
-    coexist without collision. Evaluation code can filter by that prefix.
-
-    Args:
-        n:     Persons per m-slice.
-        m_max: Maximum LOI length (default: pool_size // n).
-        seed:  Random seed.
+    For each m in 1..m_max, generate a disjoint dataset where n persons each like m unique items.
+    Returns (datasets, qrels_list, m_values).
     """
-    def _generate(n: int, m: int, seed: int, names: list[str]) -> dict:
-        items_pool, _, _ = load_pool()
-        rng = random.Random(seed)
-        pool = rng.sample(items_pool, n * m)
-        person_items = [pool[i * m:(i + 1) * m] for i in range(n)]
-        corpus = {name: _fmt_likes(name, items) for name, items in zip(names, person_items)}
-        queries, qrels = {}, {}
-        for pidx, (name, items) in enumerate(zip(names, person_items)):
-            for iidx, item in enumerate(items):
-                qid = f"query_{pidx * m + iidx}"
-                queries[qid] = f"Who likes {item}?"
-                qrels[qid] = {name: 1}
-        return {"corpus": corpus, "queries": queries, "qrels": qrels}
-
     items_pool, _, _ = load_pool()
     if m_max is None:
         m_max = len(items_pool) // n
     assert n * m_max <= len(items_pool), f"n*m_max={n*m_max} exceeds item pool size ({len(items_pool)})"
 
     names = generate_names(n, seed)
-    corpus, queries, qrels = {}, {}, {}
+    datasets, qrels_list, meta = [], [], []
+
     for m in range(1, m_max + 1):
-        d = _generate(n=n, m=m, seed=seed, names=names)
-        ns = f"m{m}/"
-        for doc_id, text in d["corpus"].items():
-            corpus[ns + doc_id] = text
-        for qid, text in d["queries"].items():
-            queries[ns + qid] = text
-            qrels[ns + qid] = {ns + doc: score for doc, score in d["qrels"][qid].items()}
-    return {"corpus": corpus, "queries": queries, "qrels": qrels}
+        rng = random.Random(seed)
+        pool = rng.sample(items_pool, n * m)
+        person_items = [pool[i * m:(i + 1) * m] for i in range(n)]
+        corpus  = {name: _fmt_likes(name, items) for name, items in zip(names, person_items)}
+        queries, qrels = {}, {}
+        for pidx, (name, items) in enumerate(zip(names, person_items)):
+            for iidx, item in enumerate(items):
+                qid = f"query_{pidx * m + iidx}"
+                queries[qid] = f"Who likes {item}?"
+                qrels[qid]   = {name: 1}
+        datasets.append({"corpus": corpus, "queries": queries})
+        qrels_list.append(qrels)
+        meta.append(m)
+
+    return datasets, qrels_list, meta
 
 
 def generate_k_shared_dataset(
@@ -72,9 +59,10 @@ def generate_k_shared_dataset(
     k: int,
     seed: int = 42,
     names: list[str] | None = None,
-) -> dict:
+) -> tuple[dict, dict]:
     """
     Generate a dataset where each item is shared by exactly k persons.
+    Returns (dataset, qrels).
 
     k=1: disjoint (each query has 1 relevant doc).
     k=2: uses a random m-regular graph (each query has 2 relevant docs).
@@ -103,33 +91,32 @@ def generate_k_shared_dataset(
             person_items[u].append(item)
             person_items[v].append(item)
 
-    corpus = {name: _fmt_likes(name, items) for name, items in zip(names, person_items)}
-
+    corpus  = {name: _fmt_likes(name, items) for name, items in zip(names, person_items)}
     queries, qrels = {}, {}
+
     if k == 1:
         for pidx, (name, items) in enumerate(zip(names, person_items)):
             for iidx, item in enumerate(items):
                 qid = f"query_{pidx * m + iidx}"
                 queries[qid] = f"Who likes {item}?"
-                qrels[qid] = {name: 1}
+                qrels[qid]   = {name: 1}
     else:
         for qidx, (item, (u, v)) in enumerate(zip(sampled_items, edges)):
             qid = f"query_{qidx}"
             queries[qid] = f"Who likes {item}?"
-            qrels[qid] = {names[u]: 1, names[v]: 1}
+            qrels[qid]   = {names[u]: 1, names[v]: 1}
 
-    return {"corpus": corpus, "queries": queries, "qrels": qrels}
+    return {"corpus": corpus, "queries": queries}, qrels
 
 
-def generate_steiner_dataset(n: int = 1849, seed: int = 42) -> dict:
+def generate_steiner_dataset(n: int = 1849, seed: int = 42) -> tuple[dict, dict]:
     """
-    Generate a dataset based on a Steiner Triple System with AND pair queries.
+    Generate a Steiner Triple System dataset with AND pair queries.
+    Returns (dataset, qrels).
 
-    Constructs STS(n) over a pool of n items so every pair of items appears in
-    exactly one document (3-item profile). Each document's 3 pairs become queries
-    "Who likes X and Y?" each with exactly one relevant document.
-
-    n must be ≡ 1 or 3 (mod 6). Default 1849 → 569,492 documents.
+    Constructs STS(n) so every pair of items appears in exactly one document.
+    Each document's 3 pairs become queries "Who likes X and Y?" with exactly one
+    relevant document each. n must be ≡ 1 or 3 (mod 6).
     """
     assert n % 6 in (1, 3), f"STS({n}) does not exist: n must be ≡ 1 or 3 (mod 6)"
     items_pool, _, _ = load_pool()
@@ -146,16 +133,15 @@ def generate_steiner_dataset(n: int = 1849, seed: int = 42) -> dict:
                 [[T(i,k), T(j,k), T(((t+1)*(i+j)) % sz, (k+1)%3)]
                  for k in range(3) for i in range(sz) for j in range(sz) if i != j]
             )
-        else:  # n % 6 == 1
+        else:
             t = (n - 1) // 6
             two_t = 2 * t
-            mod = two_t
 
             def T(x, y):
                 return n - 1 if (x, y) == (-1, -1) else x + y * two_t
 
             def L(i, j):
-                l1 = (i + j) % mod
+                l1 = (i + j) % (two_t)
                 return l1 // 2 if l1 % 2 == 0 else t + (l1 - 1) // 2
 
             raw = (
@@ -165,10 +151,10 @@ def generate_steiner_dataset(n: int = 1849, seed: int = 42) -> dict:
             )
         return [tuple(sorted(fs)) for fs in {frozenset(triple) for triple in raw}]
 
-    rng = random.Random(seed)
-    items = rng.sample(items_pool, n)
+    rng    = random.Random(seed)
+    items  = rng.sample(items_pool, n)
     triples = _sts_indices(n)
-    names = generate_names(len(triples), seed)
+    names  = generate_names(len(triples), seed)
 
     corpus, queries, qrels = {}, {}, {}
     for doc_idx, (a, b, c) in enumerate(triples):
@@ -178,6 +164,6 @@ def generate_steiner_dataset(n: int = 1849, seed: int = 42) -> dict:
         for q_offset, (x, y) in enumerate([(ia, ib), (ia, ic), (ib, ic)]):
             qid = f"query_{doc_idx * 3 + q_offset}"
             queries[qid] = f"Who likes {x} and {y}?"
-            qrels[qid] = {doc_id: 1}
+            qrels[qid]   = {doc_id: 1}
 
-    return {"corpus": corpus, "queries": queries, "qrels": qrels}
+    return {"corpus": corpus, "queries": queries}, qrels

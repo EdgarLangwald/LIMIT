@@ -1,26 +1,11 @@
 ## Overview
 
-The goal of this project is to understand the LIMIT paper in action. Currently I want to find out whether an embedding model can even embed a list of attributes meaningfully, i.e. if models fail due to geometric constraints or due to bad experiment design.
+The goal of this project is to stress test embedding models in multiple ways and see when and how they break. The code can broadly be split into three components that each have multiple interchangeable implementations: Dataset creation -> Embedding -> Evaluation. This way, multiple tests can be done on multiple models. The embedding has to be able to run locally and on a cluster. And different metrics have to be able to evaluate performance without recomputing embeddings every time.
 
-## Current state of project
+## Dataset Basics
 
-Hypothesis: Such long lists of items (loi) are unfeasable to embed for any model.
-    Question: Do document embeddings ie loi cluster more then text chunks from realistic pdf's?
-    Question: Is information about every item preserved in lois embedding? I.e. can every item be retrieved?
-Result: Clustering increases and recall steadily drops with increasing loi length (Recall@1 from 100% to 20% at n=100 people and m=1, ..., 18 items). Models can't embed a loi in a way that preserves each items meaning reliably. But they are still able to with m = 3.
+LIMIT paper provides 1848 unique items and >= 1000 american names and surnames. The embeddings consist of list of items (loi) e.g. "John Smith likes apples, winter and cats". Queries ask for specific items.
 
-
-
-## Other
-
-Path to LIMIT paper pdf "C:\OneDrive\Documents\Papers\LIMIT DeepMind.pdf"
-URL to LIMIT repo: https://github.com/google-deepmind/limit
-This Claude Code session is being run from windows powershell
-**IMPORTANT** Run all scripts from C:\OneDrive\Documents\Coding\.venv this venv. Also pip install into there
-Documentation links for RWTH Aachen Cluster:
-- Submit Jobs: https://help.itc.rwth-aachen.de/service/rhr4fjjutttf/article/13ace46cfbb84e92a64c1361e0e4c104/
-- Job Parameters: https://help.itc.rwth-aachen.de/service/rhr4fjjutttf/article/3d20a87835db4569ad9094d91874e2b4/
-- Job Management: https://help.itc.rwth-aachen.de/service/rhr4fjjutttf/article/85b21b312bfb48b290043083d2a34b8f/
 
 ## Project structure
 
@@ -39,15 +24,17 @@ Documentation links for RWTH Aachen Cluster:
 - `embeddings/` — MD5-keyed `.npy` embedding cache files
 - `models/` — downloaded SentenceTransformer model weights
 
-## Paper description for quick context
+## Coding practices
 
-**"On the Theoretical Limitations of Embedding-Based Retrieval"** (ICLR 2026)
-Weller et al., Google DeepMind & Johns Hopkins
+**IMPORTANT:** Run all scripts from C:\OneDrive\Documents\Coding\.venv this venv. Also pip install into there.
+Add to and edit Project structure that's **relevant for coding** as you work on this project, so it stays relevant.
 
-**Core claim:** Single-vector embedding models have a hard geometric ceiling. For a given embedding dimension *d*, there exist top-k subsets of documents that *no* query vector can retrieve — not because of bad training, but because the geometry doesn't allow it. The number of representable top-k combinations is bounded by *d*.
+## Other
 
-**Theoretical basis:** Connects results from linear algebra / high-dimensional geometry (Papadimitriou & Sipser) to dense retrieval. Lower-bounds the embedding dimension needed to represent a given set of query-document relevance combinations.
-
-**Empirical validation:** They bypass training entirely by *directly optimizing free parameter embeddings* on the test set.
-
-**The LIMIT dataset:** A deliberately simple synthetic-to-natural dataset. Documents are short person profiles ("Jon likes Apples and Rabbits."), queries are attribute lookups ("Who likes Apples?").
+Path to LIMIT paper pdf "C:\OneDrive\Documents\Papers\LIMIT DeepMind.pdf"
+URL to LIMIT repo: https://github.com/google-deepmind/limit
+This Claude Code session is being run from windows powershell
+Documentation links for RWTH Aachen Cluster:
+- Submit Jobs: https://help.itc.rwth-aachen.de/service/rhr4fjjutttf/article/13ace46cfbb84e92a64c1361e0e4c104/
+- Job Parameters: https://help.itc.rwth-aachen.de/service/rhr4fjjutttf/article/3d20a87835db4569ad9094d91874e2b4/
+- Job Management: https://help.itc.rwth-aachen.de/service/rhr4fjjutttf/article/85b21b312bfb48b290043083d2a34b8f/
