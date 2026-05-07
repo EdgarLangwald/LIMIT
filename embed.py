@@ -19,9 +19,10 @@ _DEFAULT_CACHE_DIR  = os.path.join(os.path.dirname(__file__), "embeddings")
 _DEFAULT_MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
 
 QUERY_PREFIXES: dict[str, str] = {
-    "BAAI/bge-large-en-v1.5":              "Represent this sentence for searching relevant passages: ",
-    "intfloat/e5-mistral-7b-instruct":     "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: ",
-    "Snowflake/snowflake-arctic-embed-l":  "Represent this sentence for searching relevant passages: ",
+    "BAAI/bge-small-en-v1.5":             "Represent this sentence for searching relevant passages: ",
+    "BAAI/bge-large-en-v1.5":             "Represent this sentence for searching relevant passages: ",
+    "intfloat/e5-mistral-7b-instruct":    "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: ",
+    "Snowflake/snowflake-arctic-embed-l": "Represent this sentence for searching relevant passages: ",
 }
 
 

@@ -2,7 +2,7 @@ import functools
 import json
 import os
 
-_POOL_PATH = os.path.join(os.path.dirname(__file__), "data", "pool.json")
+_POOL_PATH = os.path.join(os.path.dirname(__file__), "data_pool", "pool.json")
 
 
 @functools.lru_cache(maxsize=None)
