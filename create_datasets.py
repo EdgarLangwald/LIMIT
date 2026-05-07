@@ -22,6 +22,12 @@ def _fmt_likes(name: str, items: list[str]) -> str:
     return f"{name} likes {', '.join(items[:-1])} and {items[-1]}."
 
 
+def _fmt_dislikes(name: str, items: list[str]) -> str:
+    if len(items) == 1:
+        return f"{name} doesn't like {items[0]}."
+    return f"{name} doesn't like {', '.join(items[:-1])} and {items[-1]}."
+
+
 def build_disjoint_dataset(n: int, m_max: int | None = None, seed: int = 42) -> tuple[list[dict], list[dict], list[int]]:
     """
     For each m in 1..m_max, generate a disjoint dataset where n persons each like m unique items.
@@ -51,6 +57,125 @@ def build_disjoint_dataset(n: int, m_max: int | None = None, seed: int = 42) -> 
         meta.append(m)
 
     return datasets, qrels_list, meta
+
+
+def _try_greedy_preference(
+    n: int, m: int, items_pool: list, rng: random.Random
+) -> tuple[list[list], list[list], bool]:
+    """
+    Attempt to assign m positive and m negative items to each of n people such that
+    no person's positive and negative lists overlap, and every item from the sampled
+    pool appears exactly once as a positive and once as a negative.
+
+    Returns (pos_lists, neg_lists, success). On failure (last person can't be placed),
+    success=False and the lists contain n-1 entries.
+    """
+    items = rng.sample(items_pool, n * m)
+    pos_pool = list(items)
+    neg_pool = list(items)
+    pos_lists: list[list] = []
+    neg_lists: list[list] = []
+
+    for _ in range(n - 1):
+        pos_sample = rng.sample(pos_pool, m)
+        pos_set = set(pos_sample)
+        for x in pos_sample:
+            pos_pool.remove(x)
+        pos_lists.append(pos_sample)
+
+        available = [x for x in neg_pool if x not in pos_set]
+        neg_sample = rng.sample(available, m)
+        for x in neg_sample:
+            neg_pool.remove(x)
+        neg_lists.append(neg_sample)
+
+    last_pos = list(pos_pool)
+    last_pos_set = set(last_pos)
+    free = [x for x in neg_pool if x not in last_pos_set]
+
+    if len(free) >= m:
+        pos_lists.append(last_pos)
+        neg_lists.append(rng.sample(free, m))
+        return pos_lists, neg_lists, True
+
+    # Atomic swap: find person X whose neg list doesn't conflict with last_pos,
+    # and whose pos list doesn't conflict with neg_pool (so X can take neg_pool).
+    neg_pool_set = set(neg_pool)
+    for i in range(n - 1):
+        if set(neg_lists[i]).isdisjoint(last_pos_set) and neg_pool_set.isdisjoint(set(pos_lists[i])):
+            pos_lists.append(last_pos)
+            neg_lists.append(neg_lists[i])
+            neg_lists[i] = list(neg_pool)
+            return pos_lists, neg_lists, True
+
+    return pos_lists, neg_lists, False
+
+
+def build_preference_dataset(
+    n: int,
+    m_max: int | None = None,
+    seed: int = 42,
+) -> tuple[list[dict], list[dict], list[dict], list[int]]:
+    """
+    Sweep m from 1 to m_max. Each person likes m items and dislikes m other items (no overlap).
+    Every item appears exactly once as a positive and once as a negative across all people.
+    Positive and negative lists are assigned independently via greedy sampling.
+
+    Each item generates one query "Who has a preference about X?" with two relevant docs
+    (the liker and the disliker). sentiments_list tracks which doc is positive vs negative.
+
+    Returns (datasets, qrels_list, sentiments_list, m_values).
+    sentiments_list[i][qid] = {"pos": name_of_liker, "neg": name_of_disliker}
+    """
+    items_pool, _, _ = load_pool()
+    if m_max is None:
+        m_max = len(items_pool) // n
+    assert n * m_max <= len(items_pool), f"n*m_max={n*m_max} exceeds pool size ({len(items_pool)})"
+    assert n >= 2
+
+    names = generate_names(n, seed)
+    datasets, qrels_list, sentiments_list, meta = [], [], [], []
+
+    for m in range(1, m_max + 1):
+        pos_lists = neg_lists = None
+        success = False
+
+        for attempt in range(5):
+            rng = random.Random(seed + attempt)
+            pos_lists, neg_lists, success = _try_greedy_preference(n, m, items_pool, rng)
+            if success:
+                break
+
+        n_actual = len(pos_lists)
+        if not success:
+            print(f"Warning: m={m}: could not place last person after 5 attempts, using {n_actual}/{n} people")
+
+        actual_names = names[:n_actual]
+        corpus = {
+            name: _fmt_likes(name, pos) + " " + _fmt_dislikes(name, neg)
+            for name, pos, neg in zip(actual_names, pos_lists, neg_lists)
+        }
+
+        item_to_liker    = {item: name for name, pos in zip(actual_names, pos_lists) for item in pos}
+        item_to_disliker = {item: name for name, neg in zip(actual_names, neg_lists) for item in neg}
+        all_items = [item for pos in pos_lists for item in pos]
+
+        queries: dict[str, str] = {}
+        qrels: dict[str, dict] = {}
+        sentiments: dict[str, dict] = {}
+        for qid_idx, item in enumerate(all_items):
+            qid = f"query_{qid_idx}"
+            liker, disliker = item_to_liker[item], item_to_disliker[item]
+            queries[qid] = f"Who has a preference about {item}?"
+            qrels[qid] = {liker: 1, disliker: 1}
+            sentiments[qid] = {"pos": liker, "neg": disliker}
+
+        datasets.append({"corpus": corpus, "queries": queries})
+        qrels_list.append(qrels)
+        sentiments_list.append(sentiments)
+        meta.append(m)
+
+    return datasets, qrels_list, sentiments_list, meta
 
 
 def generate_k_shared_dataset(
