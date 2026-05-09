@@ -11,6 +11,7 @@ import gc
 import hashlib
 import json
 import os
+import tempfile
 
 import numpy as np
 
@@ -18,16 +19,85 @@ import numpy as np
 _DEFAULT_CACHE_DIR  = os.path.join(os.path.dirname(__file__), "embeddings")
 _DEFAULT_MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
 
-QUERY_PREFIXES: dict[str, str] = {
-    "BAAI/bge-small-en-v1.5":             "Represent this sentence for searching relevant passages: ",
-    "BAAI/bge-large-en-v1.5":             "Represent this sentence for searching relevant passages: ",
-    "intfloat/e5-mistral-7b-instruct":    "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: ",
-    "Snowflake/snowflake-arctic-embed-l": "Represent this sentence for searching relevant passages: ",
+MODELS: dict[str, dict] = {
+    # ~0.1 GB; fast baseline, decent MTEB score
+    "BGE-small": {
+        "hf_id": "BAAI/bge-small-en-v1.5",
+        "query_prefix": "Represent this sentence for searching relevant passages: ",
+    },
+    # ~1.3 GB; strong MTEB ~2023, good general baseline
+    "BGE-large": {
+        "hf_id": "BAAI/bge-large-en-v1.5",
+        "query_prefix": "Represent this sentence for searching relevant passages: ",
+    },
+    # ~0.5 GB; ModernBERT backbone, strong MTEB for its size (2024)
+    "GTE-ModernBERT": {
+        "hf_id": "Alibaba-NLP/gte-modernbert-base",
+        "query_prefix": "query: ",
+    },
+    # ~2 GB; near SOTA on MTEB at release (2024)
+    "Snowflake-Arctic-L": {
+        "hf_id": "Snowflake/snowflake-arctic-embed-l",
+        "query_prefix": "",
+    },
+    # ~1.2 GB; SOTA-tier small model, strong MTEB for size (2025)
+    "Qwen3-Embedding-0.6B": {
+        "hf_id": "Qwen/Qwen3-Embedding-0.6B",
+        "query_prefix": "query: ",
+    },
+    # ~8 GB; near SOTA on MTEB (2025)
+    "Qwen3-Embedding-4B": {
+        "hf_id": "Qwen/Qwen3-Embedding-4B",
+        "query_prefix": "query: ",
+    },
+    # ~16 GB; SOTA on MTEB at release (2025)
+    "Qwen3-Embedding-8B": {
+        "hf_id": "Qwen/Qwen3-Embedding-8B",
+        "query_prefix": "query: ",
+    },
+    # ~14 GB; was SOTA on MTEB at release (2023)
+    "E5-Mistral-7B": {
+        "hf_id": "intfloat/e5-mistral-7b-instruct",
+        "query_prefix": "Instruct: Retrieve the person whose profile contains the queried item.\nQuery: ",
+    },
+    # ~14 GB; unified embedding+generation, strong MTEB (2024)
+    "GritLM-7B": {
+        "hf_id": "GritLM/GritLM-7B",
+        "query_prefix": "<|user|>\nRetrieve the person whose profile contains the queried item.\n<|embed|>\n",
+    },
+    # ~16 GB; instruction-following retrieval based on Llama 3.1 (2024)
+    "Promptriever-Llama3-8B": {
+        "hf_id": "samaya-ai/promptriever-llama3.1-8b-instruct-v1",
+        "query_prefix": "Retrieve the person whose profile contains the queried item.\n\n",
+    },
+    # ~16 GB; #1 MTEB late 2024, instruction-following with latent attention layer
+    "NV-Embed-v2": {
+        "hf_id": "nvidia/NV-Embed-v2",
+        "query_prefix": "Instruct: Retrieve the person whose profile contains the queried item.\nQuery: ",
+    },
+    # ~14 GB; strong MTEB 2024, instruction-following, Qwen2 backbone
+    "GTE-Qwen2-7B": {
+        "hf_id": "Alibaba-NLP/gte-Qwen2-7B-instruct",
+        "query_prefix": "Instruct: Retrieve the person whose profile contains the queried item.\nQuery: ",
+    },
+    # ~1 GB; MoE architecture, 475M params (305M active), strong for size (2024)
+    "Nomic-Embed-v2-MoE": {
+        "hf_id": "nomic-ai/nomic-embed-text-v2-moe",
+        "query_prefix": "search_query: ",
+    },
+    # ~2 GB; updated Arctic-L, stronger MTEB than v1 (2024)
+    "Snowflake-Arctic-L-v2": {
+        "hf_id": "Snowflake/snowflake-arctic-embed-l-v2.0",
+        "query_prefix": "query: ",
+    },
 }
 
 
 def get_query_prefix(model_name: str) -> str:
-    return QUERY_PREFIXES.get(model_name, "")
+    for m in MODELS.values():
+        if m["hf_id"] == model_name:
+            return m["query_prefix"]
+    return ""
 
 
 def embed_dataset(
@@ -85,21 +155,39 @@ def embed_dataset(
         all_doc_texts = list({t for ds in missing_ds for t in ds["corpus"].values()})
         all_qry_texts = list({t for ds in missing_ds for t in ds["queries"].values()})
 
-        doc_embs_all = embed(all_doc_texts, model_name, prefix="",           cache_dir=None, models_dir=models_dir, device=device, batch_size=batch_size)
-        qry_embs_all = embed(all_qry_texts, model_name, prefix=query_prefix, cache_dir=None, models_dir=models_dir, device=device, batch_size=batch_size)
-
-        text_to_doc = {t: doc_embs_all[j] for j, t in enumerate(all_doc_texts)}
-        text_to_qry = {t: qry_embs_all[j] for j, t in enumerate(all_qry_texts)}
+        # Phase 1: embed docs, save per-dataset doc arrays to temp files, then free
+        doc_embs_all = embed(all_doc_texts, model_name, prefix="", cache_dir=None, models_dir=models_dir, device=device, batch_size=batch_size)
+        doc_idx = {t: j for j, t in enumerate(all_doc_texts)}
 
         rng = np.random.default_rng(seed)
+        tmp_paths = {}
+        for i in missing:
+            ds = datasets[i]
+            doc_ids = list(ds["corpus"].keys())
+            rng.shuffle(doc_ids)
+            d_embs = np.stack([doc_embs_all[doc_idx[ds["corpus"][d]]] for d in doc_ids])
+            fd, path = tempfile.mkstemp(suffix=".npz")
+            os.close(fd)
+            np.savez(path, doc_ids=np.array(doc_ids, dtype=object), d_embs=d_embs)
+            tmp_paths[i] = path
+
+        del doc_embs_all
+        gc.collect()
+
+        # Phase 2: embed queries, load doc arrays from temp, save final npz
+        qry_embs_all = embed(all_qry_texts, model_name, prefix=query_prefix, cache_dir=None, models_dir=models_dir, device=device, batch_size=batch_size)
+        qry_idx = {t: j for j, t in enumerate(all_qry_texts)}
+
         for i in missing:
             ds, fname = datasets[i], file_names[i]
-            doc_ids   = list(ds["corpus"].keys())
             query_ids = list(ds["queries"].keys())
-            rng.shuffle(doc_ids)
+            q_embs = np.stack([qry_embs_all[qry_idx[ds["queries"][q]]] for q in query_ids])
 
-            d_embs = np.stack([text_to_doc[ds["corpus"][d]]  for d in doc_ids])
-            q_embs = np.stack([text_to_qry[ds["queries"][q]] for q in query_ids])
+            tmp_data = np.load(tmp_paths[i], allow_pickle=True)
+            doc_ids = list(tmp_data["doc_ids"])
+            d_embs  = tmp_data["d_embs"].copy()
+            tmp_data.close()
+            os.unlink(tmp_paths[i])
 
             loaded[i] = {"doc_ids": doc_ids, "query_ids": query_ids, "doc_embs": d_embs, "qry_embs": q_embs}
 

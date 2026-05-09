@@ -1,5 +1,7 @@
 import os
-import pprint
+import torch
+
+print("CUDA available:", torch.cuda.is_available())
 
 def _load_env_file():
     env_path = os.path.join(os.path.dirname(__file__), ".env")
@@ -14,23 +16,26 @@ def _load_env_file():
 
 _load_env_file()
 
+import torch
 from create_datasets import generate_steiner_dataset
-from embed import embed_dataset
-from evaluate import evaluate
+from embed import embed_dataset, MODELS
 
-MODEL  = "BAAI/bge-small-en-v1.5"
-N      = 61   # N % 6 = 1 or 3
+print("CUDA available:", torch.cuda.is_available())
 
-print(f"=== Pipeline test: steiner n={N}, model={MODEL} ===\n")
+N = 1849
+MODEL_KEYS = [
+    "Qwen3-Embedding-8B",
+    "E5-Mistral-7B",
+    "GritLM-7B",
+    "Promptriever-Llama3-8B",
+]
 
-print("1. Building dataset...")
+print(f"Building steiner dataset n={N}...")
 dataset, qrels = generate_steiner_dataset(n=N)
-print(f"   {len(dataset['corpus'])} docs, {len(dataset['queries'])} queries\n")
+print(f"  {len(dataset['corpus'])} docs, {len(dataset['queries'])} queries\n")
 
-print("2. Embedding...")
-mapping = embed_dataset(dataset, MODEL, name=f"steiner_n{N}")
-print()
-
-print("3. Evaluating...")
-results = evaluate(mapping, qrels, recall_at=[1], n_values=[20, 80, 250])
-pprint.pprint(results[0])
+for key in MODEL_KEYS:
+    model = MODELS[key]["hf_id"]
+    print(f"Embedding with {key}...")
+    embed_dataset(dataset, model, name=f"steiner_FULL", batch_size=512, device="cuda")
+    print(f"  Done.\n")
