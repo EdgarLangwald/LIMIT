@@ -291,4 +291,13 @@ def generate_steiner_dataset(n: int = 1849, seed: int = 42) -> tuple[dict, dict]
             queries[qid] = f"Who likes {x} and {y}?"
             qrels[qid]   = {doc_id: 1}
 
-    return {"corpus": corpus, "queries": queries}, qrels
+    return {"corpus": corpus, "queries": queries}, qrels 
+
+# this returns (dataset, qrels)
+# dataset : {"corpus": {...}, "queries": {...}}} dict of two dicts - corpus and queries
+#
+# {...} :  {"person_0": "John Smith likes apples, eggs and horses,
+#           "person_1": "Bettie Stones likes driving, shoes and classical music",
+#               .                               .
+#               .                               .
+#           }

@@ -28,7 +28,7 @@ LIMIT paper provides 1848 unique items and >= 1000 american names and surnames. 
 
 **IMPORTANT:** Use the correct venv based on `$env:COMPUTERNAME`:
 - `EDGAR-PC` (home desktop): `C:\Users\edgar\Projekte\Python\Machine_Learning_venv\Scripts\python.exe`
-- FILL IN THE NAME HERE IF NOT 'EDGAR-PC': `C:\OneDrive\Documents\Coding\.venv\Scripts\python.exe`
+- `EDGAR_LAPTOP` (work laptop): `C:\Users\EdgarLangwald\OneDrive - neuland AI AG\Dokumente\Coding\.venv\Scripts\python.exe`
 
 Run all scripts and pip installs using the correct python.exe for the current device.
 Add to and edit Project structure that's **relevant for coding** as you work on this project, so it stays relevant.

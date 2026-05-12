@@ -2,9 +2,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 from create_datasets import build_disjoint_dataset
 from name_item_pool import load_pool
-from embed import embed, embed_dataset, get_query_prefix, _DEFAULT_CACHE_DIR, _DEFAULT_MODELS_DIR
+from embed import embed_dataset
 
-MODEL_NAME = "BAAI/bge-large-en-v1.5"
+MODEL_NAME = "BGE_L"
 
 
 def retrieval_metrics(
@@ -32,55 +32,58 @@ def retrieval_metrics(
 
 
 def evaluate(
-    mapping_or_list,
-    qrels_or_list,
+    mappings,
+    qrels,
     recall_at: list[int] = [1, 5],
     n_values: list[int] | None = None,
+    seed: int = 42,
 ) -> list[dict]:
     """
-    Compute retrieval metrics from structured mappings returned by embed_dataset.
+    Compute retrieval metrics from mappings returned by embed_dataset.
 
-    mapping_or_list: {"docs": {id: emb}, "queries": {id: emb}} or a list of these
-    qrels_or_list:   matching {query_id: {doc_id: 1}} or list of these
-    recall_at:       recall cutoffs
-    n_values:        if provided, evaluate at each corpus size by restricting to the
-                     first n doc IDs (shuffled by embed_dataset) and filtering to
-                     queries whose relevant docs are all within that prefix.
-                     Each list element is then a dict keyed by n instead of a flat metrics dict.
-
-    Returns a list parallel to the input.
+    mapping_or_list: {"doc_map": {id: idx}, "qry_map": {id: idx},
+                      "doc_embs": ndarray, "qry_embs": ndarray} or a list of these.
+    qrels_or_list:   matching {query_id: {doc_id: 1}} or list of these.
+    n_values:        if provided, evaluate at each corpus size. Doc IDs are shuffled
+                     once with `seed` and the first n are used as the corpus subset.
     """
-    mappings   = [mapping_or_list] if isinstance(mapping_or_list, dict) else mapping_or_list
-    qrels_list = [qrels_or_list]   if isinstance(qrels_or_list,   dict) else qrels_or_list
+    mappings   = [mappings] if isinstance(mappings, dict) else mappings
+    qrels = [qrels]   if isinstance(qrels,   dict) else qrels
 
     results = []
-    for mapping, qrels in zip(mappings, qrels_list):
-        doc_ids   = list(mapping["docs"].keys())        # ["John Smith", "Betty Rose", ...]
-        query_ids = list(mapping["queries"].keys())     # ["query_31", "query_14", ...]
+    for mapping, qrel in zip(mappings, qrels):
+        doc_map   = mapping["doc_map"]
+        qry_map   = mapping["qry_map"]
+        query_ids = list(qry_map.keys())
 
-        doc_embs    = np.stack([mapping["docs"][d]    for d in doc_ids])
-        qry_embs    = np.stack([mapping["queries"][q] for q in query_ids])
-        scores_full = qry_embs @ doc_embs.T           # (n_queries, n_docs)
+        if n_values is not None:
+            # shuffle doc IDs once; reorder doc_embs to match so [:n] slicing works
+            rng          = np.random.default_rng(seed)
+            shuffled_ids = list(rng.permutation(list(doc_map.keys())))
+            shuffle_idx  = [doc_map[d] for d in shuffled_ids]
+            doc_embs     = mapping["doc_embs"][shuffle_idx]
+        else:
+            doc_embs     = mapping["doc_embs"]
+            shuffled_ids = list(doc_map.keys())
+
+        scores_full = mapping["qry_embs"] @ doc_embs.T   # (n_queries, n_docs)
 
         if n_values is None:
-            doc_pos = {d: i for i, d in enumerate(doc_ids)}                 # {"John Smith": 0, "Betty Rose": 1, ...}
-            rel_idx = [[doc_pos[d] for d in qrels[q]] for q in query_ids]   # qrels["query_31"] = {"Alice Jones": 1} <- or multiple
-                                                                            # rel_idx[0] = [doc_pos[d] for d in {"Alice Jones": 1}] = [254]
+            rel_idx = [[doc_map[d] for d in qrel[q]] for q in query_ids]
             r = retrieval_metrics(scores_full, rel_idx, recall_at)
             r["n_queries"] = len(query_ids)
             results.append(r)
         else:
-            qry_pos   = {q: i for i, q in enumerate(query_ids)}
             n_results = {}
             for n in sorted(n_values):
-                subset_ids = set(doc_ids[:n])
-                subset_pos = {d: i for i, d in enumerate(doc_ids[:n])}
-                valid_qids = [q for q in query_ids if all(d in subset_ids for d in qrels[q])]
+                subset_ids = set(shuffled_ids[:n])
+                subset_pos = {d: i for i, d in enumerate(shuffled_ids[:n])}
+                valid_qids = [q for q in query_ids if all(d in subset_ids for d in qrel[q])]
                 if not valid_qids:
                     continue
-                qi_rows    = np.array([qry_pos[q] for q in valid_qids])
+                qi_rows    = np.array([qry_map[q] for q in valid_qids])
                 scores_sub = scores_full[qi_rows, :n]
-                rel_idx    = [[subset_pos[d] for d in qrels[q]] for q in valid_qids]
+                rel_idx    = [[subset_pos[d] for d in qrel[q]] for q in valid_qids]
                 r = retrieval_metrics(scores_sub, rel_idx, recall_at)
                 r["n_queries"] = len(valid_qids)
                 n_results[n]   = r
@@ -95,9 +98,7 @@ def eval_embed_distance(
     k: int = 5,
     model_name: str = MODEL_NAME,
     batch_size: int = 64,
-    cache_dir:  str = _DEFAULT_CACHE_DIR,
-    models_dir: str = _DEFAULT_MODELS_DIR,
-    device:     str | None = None,
+    device: str | None = None,
 ) -> dict[int, dict]:
     """
     For each LOI length m, embed n documents and measure three geometric properties:
@@ -115,7 +116,7 @@ def eval_embed_distance(
         m_max = len(load_pool()[0]) // n
 
     datasets, _, meta = build_disjoint_dataset(n=n, m_max=m_max)
-    mappings = embed_dataset(datasets, model_name, name=f"disjoint_n{n}", meta=meta, cache=True, cache_dir=cache_dir, models_dir=models_dir, device=device, batch_size=batch_size)
+    mappings = embed_dataset(datasets, model_name, dataset_name=f"disjoint_n{n}", cache=False, device=device, batch_size=batch_size)
 
     print(f"Model : {model_name}")
     print(f"n     : {n} documents  |  k = {k}")
@@ -124,9 +125,8 @@ def eval_embed_distance(
 
     results: dict[int, dict] = {}
     for m, mapping in zip(meta, mappings):
-        doc_ids = list(mapping["docs"].keys())
-        m_embs  = np.stack([mapping["docs"][d] for d in doc_ids])
-        n_m     = len(doc_ids)
+        m_embs = mapping["doc_embs"]
+        n_m    = len(m_embs)
 
         cos_sim = m_embs @ m_embs.T
         dists   = np.sqrt(np.clip(2.0 - 2.0 * cos_sim, 0.0, None))
