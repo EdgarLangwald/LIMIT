@@ -1,9 +1,8 @@
 """
 Embedding with structured per-dataset cache.
 
-Cache layout (single):   embeddings/{experiment_name}/{model_name}.npz
-Cache layout (multiple): embeddings/{experiment_name}/{model_name}/{i}.npz
-Each .npz contains doc_ids, query_ids, doc_embs, qry_embs for one dataset.
+Cache layout (single):   embeddings/{experiment_name}/{model_name}_d.npy  /  _q.npy
+Cache layout (multiple): embeddings/{experiment_name}/{model_name}/{i}_d.npy  /  _q.npy
 """
 
 import gc
@@ -11,6 +10,7 @@ import os
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 _DEFAULT_CACHE_DIR  = os.path.join(os.path.dirname(__file__), "embeddings")
 _DEFAULT_MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
@@ -91,15 +91,10 @@ def get_model_id(model_name: str) -> str:
     return MODELS[model_name]["hf_id"]
 
 
-def _load_dataset(path: str) -> dict:
-    data = np.load(path, allow_pickle=True)
-    doc_ids = list(data["doc_ids"])
-    qry_ids = list(data["query_ids"])
+def _load_dataset(base: str) -> dict:
     return {
-        "doc_map":  {d: i for i, d in enumerate(doc_ids)},
-        "qry_map":  {q: i for i, q in enumerate(qry_ids)},
-        "doc_embs": data["doc_embs"],
-        "qry_embs": data["qry_embs"],
+        "doc_embs": np.load(base + "_d.npy", mmap_mode="r"),
+        "qry_embs": np.load(base + "_q.npy", mmap_mode="r"),
     }
 
 
@@ -107,18 +102,17 @@ def embed_dataset(
     datasets: list[dict] | dict,
     model_name: str,
     dataset_name: str,
-    cache: bool = False,
+    force: bool = False,
     batch_size: int = 64,
     device: str | None = None,
 ) -> list[dict] | dict:
     """
     Embed one dataset or a list of datasets.
 
-    Returns {"doc_map": {id: idx}, "qry_map": {id: idx}, "doc_embs": ndarray, "qry_embs": ndarray}
-    or a list of these.
+    Returns {"doc_embs": ndarray, "qry_embs": ndarray} or a list of these.
 
-    cache=False: load from disk if present, embed and save if not.
-    cache=True:  always re-embed and overwrite.
+    force=False: load from disk if present, embed and save if not.
+    force=True:  always re-embed and overwrite.
     """
     single  = isinstance(datasets, dict)
     ds_list = [datasets] if single else datasets
@@ -129,17 +123,18 @@ def embed_dataset(
         os.path.join(_DEFAULT_CACHE_DIR, dataset_name, model_name)
     )
     paths = (
-        [os.path.join(folder, f"{model_name}.npz")]
+        [os.path.join(folder, model_name)]
         if single else
-        [os.path.join(folder, f"{i}.npz") for i in range(len(ds_list))]
+        [os.path.join(folder, str(i)) for i in range(len(ds_list))]
     )
 
-    missing = list(range(len(ds_list))) if cache else [i for i, p in enumerate(paths) if not os.path.exists(p)]
+    missing = list(range(len(ds_list))) if force else [i for i, p in enumerate(paths) if not os.path.isfile(p + "_d.npy")]
 
     if missing:
-        os.makedirs(folder, exist_ok=True)
-
         from sentence_transformers import SentenceTransformer
+        from numpy.lib.format import open_memmap
+
+        os.makedirs(folder, exist_ok=True)
         model_id         = get_model_id(model_name)
         model_local_path = os.path.join(_DEFAULT_MODELS_DIR, model_name)
         use_device       = device or _device
@@ -150,20 +145,28 @@ def embed_dataset(
             model.save(model_local_path)
 
         query_prefix = get_query_prefix(model_name)
+        dim = model.get_sentence_embedding_dimension()
 
         for i in missing:
-            ds      = ds_list[i]
-            doc_ids = list(ds["corpus"].keys())
-            qry_ids = list(ds["queries"].keys())
-            doc_embs = embed(list(ds["corpus"].values()), model, prefix="",           batch_size=batch_size)
-            qry_embs = embed(list(ds["queries"].values()), model, prefix=query_prefix, batch_size=batch_size)
-            np.savez(
-                paths[i],
-                doc_ids=np.array(doc_ids, dtype=object),
-                query_ids=np.array(qry_ids, dtype=object),
-                doc_embs=doc_embs,
-                qry_embs=qry_embs,
-            )
+            ds        = ds_list[i]
+            p         = paths[i]
+            doc_texts = list(ds["corpus"].values())
+            qry_texts = list(ds["queries"].values())
+
+            doc_mm = open_memmap(p + "_d.npy", dtype="float32", mode="w+", shape=(len(doc_texts), dim))
+            qry_mm = open_memmap(p + "_q.npy", dtype="float32", mode="w+", shape=(len(qry_texts), dim))
+
+            for start in tqdm(range(0, len(doc_texts), batch_size), desc=f"[{i}] docs"):
+                batch = doc_texts[start : start + batch_size]
+                doc_mm[start : start + len(batch)] = embed(batch, model, prefix="",           batch_size=batch_size)
+
+            for start in tqdm(range(0, len(qry_texts), batch_size), desc=f"[{i}] queries"):
+                batch = qry_texts[start : start + batch_size]
+                qry_mm[start : start + len(batch)] = embed(batch, model, prefix=query_prefix, batch_size=batch_size)
+
+            doc_mm.flush()
+            qry_mm.flush()
+            del doc_mm, qry_mm
 
         del model
         gc.collect()
@@ -183,6 +186,6 @@ def embed(
     """Return (len(texts), dim) float32 embeddings using a pre-loaded model."""
     prefixed = [prefix + t for t in texts] if prefix else texts
     return np.array(
-        model.encode(prefixed, batch_size=batch_size, normalize_embeddings=True, show_progress_bar=True),
+        model.encode(prefixed, batch_size=batch_size, normalize_embeddings=True, show_progress_bar=False),
         dtype=np.float32,
     )

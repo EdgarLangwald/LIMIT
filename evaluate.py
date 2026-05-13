@@ -93,7 +93,7 @@ def eval_embed_distance(
         m_max = len(load_pool()[0]) // n
 
     datasets, _, meta = build_disjoint_dataset(n=n, m_max=m_max)
-    mappings = embed_dataset(datasets, model_name, dataset_name=f"disjoint_n{n}", cache=False, device=device, batch_size=batch_size)
+    mappings = embed_dataset(datasets, model_name, dataset_name=f"disjoint_n{n}", force=False,device=device, batch_size=batch_size)
 
     print(f"Model : {model_name}")
     print(f"n     : {n} documents  |  k = {k}")
