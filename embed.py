@@ -130,7 +130,16 @@ def embed_dataset(
 
     missing = list(range(len(ds_list))) if force else [i for i, p in enumerate(paths) if not os.path.isfile(p + "_d.npy")]
 
+    n_cached = len(ds_list) - len(missing)
     if missing:
+        cached_note = f" ({n_cached} cached)" if n_cached else ""
+        print(f"Embedding {len(missing)}/{len(ds_list)} datasets{cached_note}")
+    else:
+        print(f"Loading {len(ds_list)} cached dataset(s)")
+
+    if missing:
+        import logging
+        logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
         from sentence_transformers import SentenceTransformer
         from numpy.lib.format import open_memmap
 
@@ -139,8 +148,10 @@ def embed_dataset(
         model_local_path = os.path.join(_DEFAULT_MODELS_DIR, model_name)
         use_device       = device or _device
         if os.path.isdir(model_local_path):
+            print(f"  model: {model_name} (local)")
             model = SentenceTransformer(model_local_path, device=use_device)
         else:
+            print(f"  model: {model_name} (downloading {model_id})")
             model = SentenceTransformer(model_id, device=use_device)
             model.save(model_local_path)
 
