@@ -7,87 +7,64 @@ from embed import embed_dataset
 MODEL_NAME = "BGE_L"
 
 
-def retrieval_metrics(
-    scores: np.ndarray,
-    relevant_indices: list[list[int]],
-    ks: list[int] = [1, 5],
-) -> dict[str, float]:
-    """
-    scores:           (n_queries, n_docs) cosine similarity matrix
-    relevant_indices: per-query list of relevant doc column indices
-    Returns recall@k for each k in ks, plus mrr.
-    """
-    recall_hits = {k: [] for k in ks}
-    mrr_vals = []
-    for qi, rel in enumerate(relevant_indices):
-        row = scores[qi]
-        rel_scores = row[np.array(rel)]
-        ranks = (row[None, :] > rel_scores[:, None]).sum(axis=1) + 1
-        mrr_vals.append(float(1.0 / ranks.min()))
-        for k in ks:
-            recall_hits[k].append(float((ranks <= k).mean()))
-    out = {f"recall@{k}": float(np.mean(recall_hits[k])) for k in ks}
-    out["mrr"] = float(np.mean(mrr_vals))
-    return out
-
-
 def evaluate(
-    mappings,
-    qrels,
-    recall_at: list[int] = [1, 5],
-    n_values: list[int] | None = None,
-    seed: int = 42,
-) -> list[dict]:
-    """
-    Compute retrieval metrics from mappings returned by embed_dataset.
+    doc_embs,          # (n_docs, dim), mmap-compatible
+    qry_embs,          # (n_queries, dim), mmap-compatible
+    qrels,             # list[list[int]] — relevant doc indices per query, aligned with qry_embs rows
+    n_values,          # list[int]
+    q_bs,              # query batch size
+    doc_bs: int = 4096,
+    seed:   int = 42,
+    ks:     list[int] = [1, 5],
+) -> dict[int, dict]:
+    # CSR layout — precomputed once outside the n loop
+    rel_lens = np.array([len(r) for r in qrels], dtype=np.int64)
+    rel_ptr  = np.empty(len(qrels) + 1, dtype=np.int64)
+    rel_ptr[0] = 0
+    np.cumsum(rel_lens, out=rel_ptr[1:])
+    rel_flat = np.concatenate([np.asarray(r, dtype=np.int64) for r in qrels])
 
-    mapping_or_list: {"doc_map": {id: idx}, "qry_map": {id: idx},
-                      "doc_embs": ndarray, "qry_embs": ndarray} or a list of these.
-    qrels_or_list:   matching {query_id: {doc_id: 1}} or list of these.
-    n_values:        if provided, evaluate at each corpus size. Doc IDs are shuffled
-                     once with `seed` and the first n are used as the corpus subset.
-    """
-    mappings   = [mappings] if isinstance(mappings, dict) else mappings
-    qrels = [qrels]   if isinstance(qrels,   dict) else qrels
+    rng      = np.random.default_rng(seed)
+    shuffled = rng.permutation(len(doc_embs))
 
-    results = []
-    for mapping, qrel in zip(mappings, qrels):
-        doc_map   = mapping["doc_map"]
-        qry_map   = mapping["qry_map"]
-        query_ids = list(qry_map.keys())
+    results = {}
+    for n in sorted(n_values):
+        doc_subs = np.sort(shuffled[:n])    # sort for sequential mmap reads
 
-        if n_values is not None:
-            # shuffle doc IDs once; reorder doc_embs to match so [:n] slicing works
-            rng          = np.random.default_rng(seed)
-            shuffled_ids = list(rng.permutation(list(doc_map.keys())))
-            shuffle_idx  = [doc_map[d] for d in shuffled_ids]
-            doc_embs     = mapping["doc_embs"][shuffle_idx]
-        else:
-            doc_embs     = mapping["doc_embs"]
-            shuffled_ids = list(doc_map.keys())
+        in_subset           = np.zeros(len(doc_embs), dtype=bool)
+        in_subset[doc_subs] = True
+        counts              = np.add.reduceat(in_subset[rel_flat].view(np.uint8), rel_ptr[:-1])
+        valid_qs            = np.where(counts == rel_lens)[0]
+        if not valid_qs.size:
+            continue
 
-        scores_full = mapping["qry_embs"] @ doc_embs.T   # (n_queries, n_docs)
+        recall_hits = {k: [] for k in ks}
+        mrr_vals    = []
 
-        if n_values is None:
-            rel_idx = [[doc_map[d] for d in qrel[q]] for q in query_ids]
-            r = retrieval_metrics(scores_full, rel_idx, recall_at)
-            r["n_queries"] = len(query_ids)
-            results.append(r)
-        else:
-            n_results = {}
-            for n in sorted(n_values):
-                subset_ids = set(shuffled_ids[:n])
-                subset_pos = {d: i for i, d in enumerate(shuffled_ids[:n])}
-                valid_qids = [q for q in query_ids if all(d in subset_ids for d in qrel[q])]
-                if not valid_qids:
-                    continue
-                qi_rows    = np.array([qry_map[q] for q in valid_qids])
-                scores_sub = scores_full[qi_rows, :n]
-                rel_idx    = [[subset_pos[d] for d in qrel[q]] for q in valid_qids]
-                r = retrieval_metrics(scores_sub, rel_idx, recall_at)
-                r["n_queries"] = len(valid_qids)
-                n_results[n]   = r
-            results.append(n_results)
+        for i in range(0, len(valid_qs), q_bs):
+            q_batch  = valid_qs[i : i + q_bs]                        # (q_bs,)
+            q_vecs   = np.asarray(qry_embs[q_batch])                 # (q_bs, dim)
+            rel_docs = [rel_flat[rel_ptr[qi] : rel_ptr[qi + 1]] for qi in q_batch]
+
+            r_scores_b = [doc_embs[rel] @ q_vecs[bi] for bi, rel in enumerate(rel_docs)]
+            better     = [np.zeros(len(r), dtype=np.int64) for r in rel_docs]
+
+            for start in range(0, n, doc_bs):
+                chunk = doc_embs[doc_subs[start : start + doc_bs]]   # (doc_bs, dim)
+                s     = q_vecs @ chunk.T                              # (q_bs, doc_bs)
+                for bi, (r_s, bet) in enumerate(zip(r_scores_b, better)):
+                    bet += (s[bi][None, :] > r_s[:, None]).sum(axis=1)
+
+            for bet, r_s in zip(better, r_scores_b):
+                ranks = bet + 1
+                mrr_vals.append(float(1.0 / ranks.min()))
+                for k in ks:
+                    recall_hits[k].append(float((ranks <= k).mean()))
+
+        out = {f"recall@{k}": float(np.mean(recall_hits[k])) for k in ks}
+        out["mrr"]       = float(np.mean(mrr_vals))
+        out["n_queries"] = len(valid_qs)
+        results[n]       = out
 
     return results
 

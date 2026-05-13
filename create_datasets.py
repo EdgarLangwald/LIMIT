@@ -46,12 +46,12 @@ def build_disjoint_dataset(n: int, m_max: int | None = None, seed: int = 42) -> 
         pool = rng.sample(items_pool, n * m)
         person_items = [pool[i * m:(i + 1) * m] for i in range(n)]
         corpus  = {name: _fmt_likes(name, items) for name, items in zip(names, person_items)}
-        queries, qrels = {}, {}
+        queries, qrels = {}, []
         for pidx, (name, items) in enumerate(zip(names, person_items)):
             for iidx, item in enumerate(items):
                 qid = f"query_{pidx * m + iidx}"
                 queries[qid] = f"Who likes {item}?"
-                qrels[qid]   = {name: 1}
+                qrels.append([pidx])
         datasets.append({"corpus": corpus, "queries": queries})
         qrels_list.append(qrels)
         meta.append(m)
@@ -160,14 +160,15 @@ def build_preference_dataset(
         item_to_disliker = {item: name for name, neg in zip(actual_names, neg_lists) for item in neg}
         all_items = [item for pos in pos_lists for item in pos]
 
+        name_to_idx = {name: i for i, name in enumerate(actual_names)}
         queries: dict[str, str] = {}
-        qrels: dict[str, dict] = {}
+        qrels: list[list[int]] = []
         sentiments: dict[str, dict] = {}
         for qid_idx, item in enumerate(all_items):
             qid = f"query_{qid_idx}"
             liker, disliker = item_to_liker[item], item_to_disliker[item]
             queries[qid] = f"Who has a preference about {item}?"
-            qrels[qid] = {liker: 1, disliker: 1}
+            qrels.append([name_to_idx[liker], name_to_idx[disliker]])
             sentiments[qid] = {"pos": liker, "neg": disliker}
 
         datasets.append({"corpus": corpus, "queries": queries})
@@ -217,19 +218,19 @@ def generate_k_shared_dataset(
             person_items[v].append(item)
 
     corpus  = {name: _fmt_likes(name, items) for name, items in zip(names, person_items)}
-    queries, qrels = {}, {}
+    queries, qrels = {}, []
 
     if k == 1:
         for pidx, (name, items) in enumerate(zip(names, person_items)):
             for iidx, item in enumerate(items):
                 qid = f"query_{pidx * m + iidx}"
                 queries[qid] = f"Who likes {item}?"
-                qrels[qid]   = {name: 1}
+                qrels.append([pidx])
     else:
         for qidx, (item, (u, v)) in enumerate(zip(sampled_items, edges)):
             qid = f"query_{qidx}"
             queries[qid] = f"Who likes {item}?"
-            qrels[qid]   = {names[u]: 1, names[v]: 1}
+            qrels.append([u, v])
 
     return {"corpus": corpus, "queries": queries}, qrels
 
@@ -281,7 +282,7 @@ def generate_steiner_dataset(n: int = 1849, seed: int = 42) -> tuple[dict, dict]
     triples = _sts_indices(n)
     names  = generate_names(len(triples), seed)
 
-    corpus, queries, qrels = {}, {}, {}
+    corpus, queries, qrels = {}, {}, []
     for doc_idx, (a, b, c) in enumerate(triples):
         ia, ib, ic = items[a], items[b], items[c]
         doc_id = f"person_{doc_idx}"
@@ -289,7 +290,7 @@ def generate_steiner_dataset(n: int = 1849, seed: int = 42) -> tuple[dict, dict]
         for q_offset, (x, y) in enumerate([(ia, ib), (ia, ic), (ib, ic)]):
             qid = f"query_{doc_idx * 3 + q_offset}"
             queries[qid] = f"Who likes {x} and {y}?"
-            qrels[qid]   = {doc_id: 1}
+            qrels.append([doc_idx])
 
     return {"corpus": corpus, "queries": queries}, qrels 
 
