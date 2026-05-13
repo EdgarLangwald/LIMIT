@@ -6,6 +6,7 @@ Cache layout (multiple): embeddings/{experiment_name}/{model_name}/{i}_d.npy  / 
 """
 
 import gc
+import json
 import os
 
 import numpy as np
@@ -84,6 +85,33 @@ MODELS: dict[str, dict] = {
     },
 }
 
+def _progress_path(p: str) -> str:
+    return p + "_progress.json"
+
+def _load_progress(p: str) -> dict | None:
+    pp = _progress_path(p)
+    if os.path.isfile(pp):
+        with open(pp) as f:
+            return json.load(f)
+    return None
+
+def _save_progress(p: str, data: dict) -> None:
+    with open(_progress_path(p), "w") as f:
+        json.dump(data, f)
+
+def _clear_progress(p: str) -> None:
+    pp = _progress_path(p)
+    if os.path.isfile(pp):
+        os.remove(pp)
+
+def _is_complete(p: str) -> bool:
+    return (
+        os.path.isfile(p + "_d.npy")
+        and os.path.isfile(p + "_q.npy")
+        and not os.path.isfile(p + "_progress.json")
+    )
+
+
 def get_query_prefix(model_name: str) -> str:
     return MODELS[model_name]["query_prefix"]
 
@@ -128,7 +156,7 @@ def embed_dataset(
         [os.path.join(folder, str(i)) for i in range(len(ds_list))]
     )
 
-    missing = list(range(len(ds_list))) if force else [i for i, p in enumerate(paths) if not os.path.isfile(p + "_d.npy")]
+    missing = list(range(len(ds_list))) if force else [i for i, p in enumerate(paths) if not _is_complete(p)]
 
     n_cached = len(ds_list) - len(missing)
     if missing:
@@ -164,20 +192,42 @@ def embed_dataset(
             doc_texts = list(ds["corpus"].values())
             qry_texts = list(ds["queries"].values())
 
-            doc_mm = open_memmap(p + "_d.npy", dtype="float32", mode="w+", shape=(len(doc_texts), dim))
-            qry_mm = open_memmap(p + "_q.npy", dtype="float32", mode="w+", shape=(len(qry_texts), dim))
+            progress  = None if force else _load_progress(p)
+            # docs are done if: no progress file (clean between-phase state) or progress says so
+            docs_done = (not force) and (progress is None or progress.get("docs_done", False)) and os.path.isfile(p + "_d.npy")
+            doc_start = progress.get("doc_start", 0) if (progress and not docs_done) else 0
+            qry_start = progress.get("qry_start", 0) if (progress and docs_done) else 0
 
-            for start in tqdm(range(0, len(doc_texts), batch_size), desc=f"[{i}] docs"):
-                batch = doc_texts[start : start + batch_size]
-                doc_mm[start : start + len(batch)] = embed(batch, model, prefix="",           batch_size=batch_size)
+            n_doc_batches = (len(doc_texts) + batch_size - 1) // batch_size
+            n_qry_batches = (len(qry_texts) + batch_size - 1) // batch_size
 
-            for start in tqdm(range(0, len(qry_texts), batch_size), desc=f"[{i}] queries"):
+            doc_mm = open_memmap(p + "_d.npy", dtype="float32", mode="r+" if docs_done else "w+", shape=(len(doc_texts), dim))
+
+            if not docs_done:
+                for start in tqdm(range(doc_start, len(doc_texts), batch_size),
+                                  desc=f"[{i}] docs",
+                                  initial=doc_start // batch_size,
+                                  total=n_doc_batches):
+                    batch = doc_texts[start : start + batch_size]
+                    doc_mm[start : start + len(batch)] = embed(batch, model, prefix="", batch_size=batch_size)
+                    _save_progress(p, {"docs_done": False, "doc_start": start + len(batch)})
+                doc_mm.flush()
+                _clear_progress(p)
+
+            qry_exists = os.path.isfile(p + "_q.npy")
+            qry_mm = open_memmap(p + "_q.npy", dtype="float32", mode="r+" if qry_exists else "w+", shape=(len(qry_texts), dim))
+
+            for start in tqdm(range(qry_start, len(qry_texts), batch_size),
+                              desc=f"[{i}] queries",
+                              initial=qry_start // batch_size,
+                              total=n_qry_batches):
                 batch = qry_texts[start : start + batch_size]
                 qry_mm[start : start + len(batch)] = embed(batch, model, prefix=query_prefix, batch_size=batch_size)
+                _save_progress(p, {"docs_done": True, "qry_start": start + len(batch)})
 
-            doc_mm.flush()
             qry_mm.flush()
             del doc_mm, qry_mm
+            _clear_progress(p)
 
         del model
         gc.collect()

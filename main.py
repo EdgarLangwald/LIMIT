@@ -22,9 +22,12 @@ from embed import embed_dataset, MODELS
 
 print("CUDA available:", torch.cuda.is_available())
 
-N = 49
+N = 1849 # max: 1849. Valid n = 1 or 3 mod 6
 MODEL_KEYS = [
-    "Qwen0.6b"
+    "Qwen8b",
+    "GritLM",
+    "Promptriever",
+    "E5_Mistral"
 ]
 
 print(f"Building steiner dataset n={N}...")
@@ -33,5 +36,5 @@ print(f"  {len(dataset['corpus'])} docs, {len(dataset['queries'])} queries\n")
 
 for key in MODEL_KEYS:
     print(f"Embedding with {key}...")
-    embed_dataset(dataset, key, dataset_name="steiner_FULL", batch_size=64)
+    embed_dataset(dataset, key, dataset_name="steiner_FULL", batch_size=800)
     print(f"  Done.\n")

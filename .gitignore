@@ -7,5 +7,7 @@
 /__pycache__
 /.env
 *.pdf
+*.out
+*.err
 \!!!_start-claude.bat
 notizen.txt
