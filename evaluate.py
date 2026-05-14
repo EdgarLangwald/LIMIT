@@ -121,7 +121,7 @@ def eval_embed_distance(
     return results
 
 
-def plot_results(results: list[dict], meta: list) -> None:
+def plot_results(results: list[dict], meta: list, model_name: str = "", show: bool = True) -> None:
     ks  = sorted(int(k.split("@")[1]) for k in results[0] if k.startswith("recall@"))
     mrr = [r["mrr"] for r in results]
 
@@ -129,14 +129,22 @@ def plot_results(results: list[dict], meta: list) -> None:
     for i, k in enumerate(ks):
         ax.plot(meta, [r[f"recall@{k}"] for r in results], marker="os^Dv"[i % 5], label=f"Recall@{k}")
     ax.plot(meta, mrr, marker="x", linestyle="--", label="MRR")
-    ax.set_xlabel("parameter")
+    ax.set_xlabel("n")
     ax.set_ylabel("Score")
     ax.set_xticks(meta)
     ax.set_ylim(0, 1.05)
+    if model_name:
+        ax.set_title(model_name)
     ax.legend()
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.show()
+    if show:
+        plt.show()
+    else:
+        fname = f"{model_name}.png" if model_name else "results.png"
+        plt.savefig(fname, dpi=150)
+        plt.close(fig)
+        print(f"  Saved plot: {fname}")
 
 
 def plot_embed_distance(results: dict[int, dict]) -> None:

@@ -20,8 +20,6 @@ import torch
 from create_datasets import generate_steiner_dataset
 from embed import embed_dataset, MODELS
 
-print("CUDA available:", torch.cuda.is_available())
-
 N = 1849 # max: 1849. Valid n = 1 or 3 mod 6
 MODEL_KEYS = [
     "Qwen8b",

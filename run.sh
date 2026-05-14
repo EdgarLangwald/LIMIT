@@ -2,7 +2,7 @@
 #SBATCH --job-name=embed_FULL
 #SBATCH --partition=c23g
 #SBATCH --gres=gpu:1
-#SBATCH --time=01:30:00
+#SBATCH --time=03:00:00
 #SBATCH --output=/home/nld68820/LIMIT/output.out
 #SBATCH --error=/home/nld68820/LIMIT/output.err
 #SBATCH -N 1
