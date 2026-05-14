@@ -4,18 +4,16 @@ from create_datasets import build_disjoint_dataset
 from name_item_pool import load_pool
 from embed import embed_dataset
 
-MODEL_NAME = "BGE_L"
-
-
 def evaluate(
-    doc_embs,          # (n_docs, dim), mmap-compatible
-    qry_embs,          # (n_queries, dim), mmap-compatible
-    qrels,             # list[list[int]] — relevant doc indices per query, aligned with qry_embs rows
-    n_values,          # list[int]
-    q_bs,              # query batch size
-    doc_bs: int = 4096,
-    seed:   int = 42,
-    ks:     list[int] = [1, 5],
+    doc_embs,               # (n_docs, dim), mmap-compatible
+    qry_embs,               # (n_queries, dim), mmap-compatible
+    qrels,                  # list[list[int]] — relevant doc indices per query, aligned with qry_embs rows
+    n_values,               # list[int]
+    q_bs,                   # query batch size
+    doc_bs:   int = 4096,
+    seed:     int = 42,
+    ks:       list[int] = [1, 5],
+    fixed_rel_size: int | None = None,  # set to fixed rel-docs-per-query for vectorised path; None for variable
 ) -> dict[int, dict]:
     # CSR layout — precomputed once outside the n loop
     rel_lens = np.array([len(r) for r in qrels], dtype=np.int64)
@@ -46,20 +44,35 @@ def evaluate(
             q_vecs   = np.asarray(qry_embs[q_batch])                 # (q_bs, dim)
             rel_docs = [rel_flat[rel_ptr[qi] : rel_ptr[qi + 1]] for qi in q_batch]
 
-            r_scores_b = [doc_embs[rel] @ q_vecs[bi] for bi, rel in enumerate(rel_docs)]
-            better     = [np.zeros(len(r), dtype=np.int64) for r in rel_docs]
+            if fixed_rel_size is not None:
+                rel_idx    = np.array(rel_docs)                                      # (q_bs, R)
+                r_scores_b = np.einsum('qrd,qd->qr', doc_embs[rel_idx], q_vecs)     # (q_bs, R)
+                better     = np.zeros((len(q_batch), fixed_rel_size), dtype=np.int64)
 
-            for start in range(0, n, doc_bs):
-                chunk = doc_embs[doc_subs[start : start + doc_bs]]   # (doc_bs, dim)
-                s     = q_vecs @ chunk.T                              # (q_bs, doc_bs)
-                for bi, (r_s, bet) in enumerate(zip(r_scores_b, better)):
-                    bet += (s[bi][None, :] > r_s[:, None]).sum(axis=1)
+                for start in range(0, n, doc_bs):
+                    chunk   = doc_embs[doc_subs[start : start + doc_bs]]             # (doc_bs, dim)
+                    s       = q_vecs @ chunk.T                                       # (q_bs, doc_bs)
+                    better += (s[:, None, :] > r_scores_b[:, :, None]).sum(axis=2)  # (q_bs, R)
 
-            for bet, r_s in zip(better, r_scores_b):
-                ranks = bet + 1
-                mrr_vals.append(float(1.0 / ranks.min()))
+                ranks = better + 1                                                   # (q_bs, R)
+                mrr_vals.extend((1.0 / ranks.min(axis=1)).tolist())
                 for k in ks:
-                    recall_hits[k].append(float((ranks <= k).mean()))
+                    recall_hits[k].extend((ranks <= k).mean(axis=1).tolist())
+            else:
+                r_scores_b = [doc_embs[rel] @ q_vecs[bi] for bi, rel in enumerate(rel_docs)]
+                better     = [np.zeros(len(r), dtype=np.int64) for r in rel_docs]
+
+                for start in range(0, n, doc_bs):
+                    chunk = doc_embs[doc_subs[start : start + doc_bs]]              # (doc_bs, dim)
+                    s     = q_vecs @ chunk.T                                        # (q_bs, doc_bs)
+                    for bi, (r_s, bet) in enumerate(zip(r_scores_b, better)):
+                        bet += (s[bi][None, :] > r_s[:, None]).sum(axis=1)
+
+                for bet, r_s in zip(better, r_scores_b):
+                    ranks = bet + 1
+                    mrr_vals.append(float(1.0 / ranks.min()))
+                    for k in ks:
+                        recall_hits[k].append(float((ranks <= k).mean()))
 
         out = {f"recall@{k}": float(np.mean(recall_hits[k])) for k in ks}
         out["mrr"]       = float(np.mean(mrr_vals))
@@ -73,7 +86,7 @@ def eval_embed_distance(
     n: int = 100,
     m_max: int | None = None,
     k: int = 5,
-    model_name: str = MODEL_NAME,
+    model_name: str = "model",
     batch_size: int = 64,
     device: str | None = None,
 ) -> dict[int, dict]:

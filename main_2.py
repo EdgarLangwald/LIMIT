@@ -38,9 +38,10 @@ for key in MODEL_KEYS:
         doc_embs=doc_embs,
         qry_embs=qry_embs,
         qrels=qrels,
-        n_values=[2500, 7000, 21000, 65000, 190000, 569492],
+        n_values=[1000, 2500, 5000, 10000, 25000, 50000] + [100000*i for i in range(1, 7)],
         q_bs=4000,
-        ks=[2, 5, 10, 50, 200, 1000]
+        ks=[2, 10, 50, 200, 1000],
+        fixed_rel_size=2,
     )
 
     plot_results(list(results.values()), list(results.keys()), model_name=key, show=False)
