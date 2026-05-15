@@ -1,4 +1,8 @@
+import json
+import os
+import time
 import numpy as np
+import torch
 import matplotlib.pyplot as plt
 from create_datasets import build_disjoint_dataset
 from name_item_pool import load_pool
@@ -14,8 +18,12 @@ def evaluate(
     seed:     int = 42,
     ks:       list[int] = [1, 5],
     fixed_rel_size: int | None = None,  # set to fixed rel-docs-per-query for vectorised path; None for variable
+    save_json: str | bool = False,      # path to accumulating JSON, or True for "results.json"
+    device:   str | None = None,        # e.g. "cuda", "cuda:1", "cpu"; None → auto-detect
 ) -> dict[int, dict]:
-    # CSR layout — precomputed once outside the n loop
+    dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+
+    t0 = time.time()
     rel_lens = np.array([len(r) for r in qrels], dtype=np.int64)
     rel_ptr  = np.empty(len(qrels) + 1, dtype=np.int64)
     rel_ptr[0] = 0
@@ -25,59 +33,91 @@ def evaluate(
     rng      = np.random.default_rng(seed)
     shuffled = rng.permutation(len(doc_embs))
 
-    results = {}
-    for n in sorted(n_values):
-        doc_subs = np.sort(shuffled[:n])    # sort for sequential mmap reads
+    # For each query: smallest n at which all its relevant docs are in shuffled[:n]
+    pos           = np.empty(len(doc_embs), dtype=np.int64)
+    pos[shuffled] = np.arange(len(doc_embs), dtype=np.int64)
+    valid_at_n    = np.maximum.reduceat(pos[rel_flat], rel_ptr[:-1]) + 1
+    print(f"  [pre-work] CSR + permutation + valid_at_n: {time.time() - t0:.2f}s")
 
-        in_subset           = np.zeros(len(doc_embs), dtype=bool)
-        in_subset[doc_subs] = True
-        counts              = np.add.reduceat(in_subset[rel_flat].view(np.uint8), rel_ptr[:-1])
-        valid_qs            = np.where(counts == rel_lens)[0]
+    # Precompute relevant-doc scores for all queries once (not per-n)
+    n_queries = len(qrels)
+    t_pre = time.time()
+    if fixed_rel_size is not None:
+        rel_idx_all  = rel_flat.reshape(n_queries, fixed_rel_size)
+        r_scores_all = torch.empty((n_queries, fixed_rel_size), dtype=torch.float32, device=dev)
+        for i in range(0, n_queries, q_bs):
+            q_end    = min(i + q_bs, n_queries)
+            q_vecs   = torch.from_numpy(np.asarray(qry_embs[i:q_end])).to(dev)
+            rel_docs = torch.from_numpy(np.asarray(doc_embs[rel_idx_all[i:q_end]])).to(dev)
+            r_scores_all[i:q_end] = torch.einsum('qrd,qd->qr', rel_docs, q_vecs)
+        better_all = torch.zeros((n_queries, fixed_rel_size), dtype=torch.int64, device=dev)
+    else:
+        r_scores_flat = torch.empty(len(rel_flat), dtype=torch.float32, device=dev)
+        for i in range(0, n_queries, q_bs):
+            q_end  = min(i + q_bs, n_queries)
+            q_vecs = torch.from_numpy(np.asarray(qry_embs[i:q_end])).to(dev)
+            for bi, qi in enumerate(range(i, q_end)):
+                sl      = slice(int(rel_ptr[qi]), int(rel_ptr[qi + 1]))
+                rel_doc = torch.from_numpy(np.asarray(doc_embs[rel_flat[sl]])).to(dev)
+                r_scores_flat[sl] = rel_doc @ q_vecs[bi]
+        better_flat = torch.zeros(len(rel_flat), dtype=torch.int64, device=dev)
+    print(f"  [pre-work] relevant-doc scores: {time.time() - t_pre:.2f}s")
+
+    results = {}
+    n_prev  = 0
+    for n in sorted(n_values):
+        t_n = time.time()
+
+        # Only score docs added since the previous checkpoint
+        new_docs = np.sort(shuffled[n_prev:n])  # sorted for sequential mmap reads
+
+        for start in range(0, len(new_docs), doc_bs):
+            chunk = torch.from_numpy(np.asarray(doc_embs[new_docs[start:start + doc_bs]])).to(dev)
+            for i in range(0, n_queries, q_bs):
+                q_end  = min(i + q_bs, n_queries)
+                q_vecs = torch.from_numpy(np.asarray(qry_embs[i:q_end])).to(dev)
+                s      = q_vecs @ chunk.T                                     # (q_bs, chunk_bs) on GPU
+                if fixed_rel_size is not None:
+                    better_all[i:q_end] += (s[:, None, :] > r_scores_all[i:q_end, :, None]).sum(dim=2)
+                else:
+                    for bi, qi in enumerate(range(i, q_end)):
+                        r_s = r_scores_flat[rel_ptr[qi]:rel_ptr[qi + 1]]
+                        better_flat[rel_ptr[qi]:rel_ptr[qi + 1]] += (s[bi][None, :] > r_s[:, None]).sum(dim=1)
+
+        n_prev   = n
+        valid_qs = np.where(valid_at_n <= n)[0]
         if not valid_qs.size:
             continue
 
-        recall_hits = {k: [] for k in ks}
-        mrr_vals    = []
-
-        for i in range(0, len(valid_qs), q_bs):
-            q_batch  = valid_qs[i : i + q_bs]                        # (q_bs,)
-            q_vecs   = np.asarray(qry_embs[q_batch])                 # (q_bs, dim)
-            rel_docs = [rel_flat[rel_ptr[qi] : rel_ptr[qi + 1]] for qi in q_batch]
-
-            if fixed_rel_size is not None:
-                rel_idx    = np.array(rel_docs)                                      # (q_bs, R)
-                r_scores_b = np.einsum('qrd,qd->qr', doc_embs[rel_idx], q_vecs)     # (q_bs, R)
-                better     = np.zeros((len(q_batch), fixed_rel_size), dtype=np.int64)
-
-                for start in range(0, n, doc_bs):
-                    chunk   = doc_embs[doc_subs[start : start + doc_bs]]             # (doc_bs, dim)
-                    s       = q_vecs @ chunk.T                                       # (q_bs, doc_bs)
-                    better += (s[:, None, :] > r_scores_b[:, :, None]).sum(axis=2)  # (q_bs, R)
-
-                ranks = better + 1                                                   # (q_bs, R)
-                mrr_vals.extend((1.0 / ranks.min(axis=1)).tolist())
+        if fixed_rel_size is not None:
+            valid_qs_t  = torch.from_numpy(valid_qs).to(dev)
+            ranks       = better_all[valid_qs_t] + 1                        # (valid_qs, R) on GPU
+            mrr_vals    = (1.0 / ranks.min(dim=1).values).tolist()
+            recall_hits = {k: (ranks <= k).float().mean(dim=1).tolist() for k in ks}
+        else:
+            mrr_vals    = []
+            recall_hits = {k: [] for k in ks}
+            for qi in valid_qs:
+                ranks = better_flat[rel_ptr[qi]:rel_ptr[qi + 1]] + 1
+                mrr_vals.append(float(1.0 / ranks.min()))
                 for k in ks:
-                    recall_hits[k].extend((ranks <= k).mean(axis=1).tolist())
-            else:
-                r_scores_b = [doc_embs[rel] @ q_vecs[bi] for bi, rel in enumerate(rel_docs)]
-                better     = [np.zeros(len(r), dtype=np.int64) for r in rel_docs]
+                    recall_hits[k].append(float((ranks <= k).float().mean()))
 
-                for start in range(0, n, doc_bs):
-                    chunk = doc_embs[doc_subs[start : start + doc_bs]]              # (doc_bs, dim)
-                    s     = q_vecs @ chunk.T                                        # (q_bs, doc_bs)
-                    for bi, (r_s, bet) in enumerate(zip(r_scores_b, better)):
-                        bet += (s[bi][None, :] > r_s[:, None]).sum(axis=1)
-
-                for bet, r_s in zip(better, r_scores_b):
-                    ranks = bet + 1
-                    mrr_vals.append(float(1.0 / ranks.min()))
-                    for k in ks:
-                        recall_hits[k].append(float((ranks <= k).mean()))
-
-        out = {f"recall@{k}": float(np.mean(recall_hits[k])) for k in ks}
+        out              = {f"recall@{k}": float(np.mean(recall_hits[k])) for k in ks}
         out["mrr"]       = float(np.mean(mrr_vals))
         out["n_queries"] = len(valid_qs)
         results[n]       = out
+        print(f"  [n={n}] done in {time.time() - t_n:.1f}s  ({len(valid_qs)} queries)")
+
+        if save_json:
+            json_file = save_json if isinstance(save_json, str) else "results.json"
+            existing = {}
+            if os.path.exists(json_file):
+                with open(json_file) as f:
+                    existing = json.load(f)
+            existing[str(n)] = out
+            with open(json_file, "w") as f:
+                json.dump(existing, f, indent=2)
 
     return results
 
@@ -145,6 +185,7 @@ def plot_results(results: list[dict], meta: list, model_name: str = "", show: bo
     ax.set_xlabel("n")
     ax.set_ylabel("Score")
     ax.set_xticks(meta)
+    ax.set_xticklabels([f"{n/1000:.0f}k" if n >= 1000 else str(n) for n in meta])
     ax.set_ylim(0, 1.05)
     if model_name:
         ax.set_title(model_name)

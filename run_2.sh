@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=eval_FULL
 #SBATCH --partition=c23ms
-#SBATCH --time=03:00:00
+#SBATCH --time=12:00:00
 #SBATCH --output=/home/nld68820/LIMIT/output_2.out
 #SBATCH --error=/home/nld68820/LIMIT/output_2.err
 #SBATCH -N 1
@@ -11,4 +11,6 @@
 module load Python/3.12.3
 source /home/nld68820/.venv/bin/activate
 
-python main_2.py
+export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
+
+python -u main_2.py
