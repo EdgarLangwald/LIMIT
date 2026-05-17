@@ -180,8 +180,9 @@ def embed_dataset(
             model = SentenceTransformer(model_local_path, device=use_device)
         else:
             print(f"  model: {model_name} (downloading {model_id})")
-            model = SentenceTransformer(model_id, device=use_device)
-            model.save(model_local_path)
+            from huggingface_hub import snapshot_download
+            snapshot_download(repo_id=model_id, local_dir=model_local_path)
+            model = SentenceTransformer(model_local_path, device=use_device)
 
         query_prefix = get_query_prefix(model_name)
         dim = model.get_sentence_embedding_dimension()

@@ -9,5 +9,6 @@
 *.pdf
 *.out
 *.err
+*.json
 \!!!_start-claude.bat
 notizen.txt
