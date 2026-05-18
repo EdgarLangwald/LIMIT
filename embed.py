@@ -156,7 +156,17 @@ def embed_dataset(
         [os.path.join(folder, str(i)) for i in range(len(ds_list))]
     )
 
-    missing = list(range(len(ds_list))) if force else [i for i, p in enumerate(paths) if not _is_complete(p)]
+    def _shape_ok(p: str, ds: dict) -> bool:
+        try:
+            return (np.load(p + "_d.npy", mmap_mode="r").shape[0] == len(ds["corpus"]) and
+                    np.load(p + "_q.npy", mmap_mode="r").shape[0] == len(ds["queries"]))
+        except Exception:
+            return False
+
+    missing = list(range(len(ds_list))) if force else [
+        i for i, (p, ds) in enumerate(zip(paths, ds_list))
+        if not _is_complete(p) or not _shape_ok(p, ds)
+    ]
 
     n_cached = len(ds_list) - len(missing)
     if missing:
@@ -196,6 +206,8 @@ def embed_dataset(
             progress  = None if force else _load_progress(p)
             # docs are done if: no progress file (clean between-phase state) or progress says so
             docs_done = (not force) and (progress is None or progress.get("docs_done", False)) and os.path.isfile(p + "_d.npy")
+            if docs_done and np.load(p + "_d.npy", mmap_mode="r").shape[0] != len(doc_texts):
+                docs_done = False  # stale cache from a run with a different corpus size
             doc_start = progress.get("doc_start", 0) if (progress and not docs_done) else 0
             qry_start = progress.get("qry_start", 0) if (progress and docs_done) else 0
 
@@ -216,6 +228,9 @@ def embed_dataset(
                 _clear_progress(p)
 
             qry_exists = os.path.isfile(p + "_q.npy")
+            if qry_exists and np.load(p + "_q.npy", mmap_mode="r").shape[0] != len(qry_texts):
+                qry_exists = False  # stale cache; rewrite with correct size
+                qry_start = 0
             qry_mm = open_memmap(p + "_q.npy", dtype="float32", mode="r+" if qry_exists else "w+", shape=(len(qry_texts), dim))
 
             for start in tqdm(range(qry_start, len(qry_texts), batch_size),

@@ -22,15 +22,15 @@ from embed import embed_dataset
 from evaluate import evaluate_preference
 
 M = 2
-N = 100
-MODEL_KEYS = ["Qwen0.6b"]
+N = 1849 // 2
+MODEL_KEYS = ["Qwen8b", "GritLM", "Promptriever", "E5_Mistral", "Qwen4b", "Qwen0.6b", "ModernBERT", "Snowflake_v2"]
 
 print(f"Building preference dataset n={N}, m={M}...")
 dataset, qrels, sentiments = build_preference_dataset(n=N, m=M)
 print(f"  {len(dataset['corpus'])} docs, {len(dataset['queries'])} queries\n")
 
 for MODEL_KEY in MODEL_KEYS:
-    FILE_NAME = f"{MODEL_KEY} Preference Dataset"
+    FILE_NAME = f"Preference dataset/{MODEL_KEY}"
 
     print(f"Embedding with {MODEL_KEY}...")
     mapping = embed_dataset(dataset, MODEL_KEY, dataset_name=FILE_NAME)
