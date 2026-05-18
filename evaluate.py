@@ -4,7 +4,7 @@ import time
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
-from create_datasets import build_disjoint_dataset
+from create_datasets import increase_param
 from name_item_pool import load_pool
 from embed import embed_dataset
 
@@ -145,8 +145,10 @@ def eval_embed_distance(
     if m_max is None:
         m_max = len(load_pool()[0]) // n
 
-    datasets, _, meta = build_disjoint_dataset(n=n, m_max=m_max)
-    mappings = embed_dataset(datasets, model_name, dataset_name=f"disjoint_n{n}", force=False,device=device, batch_size=batch_size)
+    results_raw = increase_param("build_disjoint_dataset", "m", range(1, m_max + 1), n=n)
+    datasets = [r[0] for r in results_raw]
+    meta = list(range(1, m_max + 1))
+    mappings = embed_dataset(datasets, model_name, dataset_name=f"disjoint_n{n}", force=False, device=device, batch_size=batch_size)
 
     print(f"Model : {model_name}")
     print(f"n     : {n} documents  |  k = {k}")
@@ -174,7 +176,122 @@ def eval_embed_distance(
     return results
 
 
-def plot_results(results: list[dict], meta: list, model_name: str = "", show: bool = True) -> None:
+def evaluate_preference(
+    doc_embs,           # (n_docs, dim)
+    qry_embs,           # (n_queries, dim), aligned with qrels and sentiments
+    qrels,              # list[list[int]]
+    sentiments,         # list[dict] aligned with qrels; each has {type, liker_idx, disliker_idx}
+    ks: list[int] = [1, 2],
+    margin: float = 0.05,
+    device: str | None = None,
+    file_name: str | None = None,
+) -> dict:
+    """
+    Evaluate a preference dataset on three metrics:
+      a) recall@k per query type (like / dislike / neutral)
+      b) sentiment capture rate with margin: fraction of like-queries where
+         score(liker) > score(disliker) + margin, and likewise for dislike-queries
+      c) bias of neutral queries: mean(score(liker) - score(disliker)) and the
+         fraction of neutral queries where the liker scores higher
+    """
+    dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+
+    doc_t = torch.from_numpy(np.asarray(doc_embs)).to(dev)   # (n_docs, dim)
+    qry_t = torch.from_numpy(np.asarray(qry_embs)).to(dev)   # (n_queries, dim)
+    S = qry_t @ doc_t.T                                       # (n_queries, n_docs)
+    n_docs = doc_t.shape[0]
+
+    like_qs    = [i for i, s in enumerate(sentiments) if s["type"] == "like"]
+    dislike_qs = [i for i, s in enumerate(sentiments) if s["type"] == "dislike"]
+    neutral_qs = [i for i, s in enumerate(sentiments) if s["type"] == "neutral"]
+
+    out = {}
+
+    # a) recall@k per type
+    for type_name, qs in [("like", like_qs), ("dislike", dislike_qs), ("neutral", neutral_qs)]:
+        if not qs:
+            continue
+        for k in ks:
+            recalls = []
+            for qi in qs:
+                rel = qrels[qi]
+                topk = torch.topk(S[qi], min(k, n_docs)).indices.cpu().numpy()
+                recalls.append(sum(1 for r in rel if r in topk) / len(rel))
+            out[f"recall@{k}_{type_name}"] = float(np.mean(recalls))
+
+    # b) sentiment capture with margin
+    like_capture = [
+        float(S[qi, sentiments[qi]["liker_idx"]].item() > S[qi, sentiments[qi]["disliker_idx"]].item() + margin)
+        for qi in like_qs
+    ]
+    dislike_capture = [
+        float(S[qi, sentiments[qi]["disliker_idx"]].item() > S[qi, sentiments[qi]["liker_idx"]].item() + margin)
+        for qi in dislike_qs
+    ]
+    if like_capture:
+        out["sentiment_capture_like"] = float(np.mean(like_capture))
+    if dislike_capture:
+        out["sentiment_capture_dislike"] = float(np.mean(dislike_capture))
+
+    # c) neutral query bias
+    if neutral_qs:
+        bias = np.array([
+            S[qi, sentiments[qi]["liker_idx"]].item() - S[qi, sentiments[qi]["disliker_idx"]].item()
+            for qi in neutral_qs
+        ])
+        out["neutral_bias_mean"] = float(bias.mean())          # + → liker-favored
+        out["neutral_bias_liker_frac"] = float((bias > 0).mean())  # fraction preferring liker
+
+    if file_name:
+        _plot_preference_results(out, ks, margin, file_name)
+        with open(f"{file_name}.json", "w") as f:
+            json.dump(out, f, indent=2)
+        print(f"  Saved: {file_name}.png / {file_name}.json")
+
+    return out
+
+
+def _plot_preference_results(out: dict, ks: list[int], margin: float, file_name: str) -> None:
+    types = [t for t in ("like", "dislike", "neutral") if any(f"recall@{k}_{t}" in out for k in ks)]
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    fig.suptitle(file_name)
+
+    # a) recall@k grouped by query type
+    x = np.arange(len(types))
+    width = 0.8 / len(ks)
+    for i, k in enumerate(ks):
+        vals = [out.get(f"recall@{k}_{t}", 0.0) for t in types]
+        axes[0].bar(x + (i - (len(ks) - 1) / 2) * width, vals, width, label=f"recall@{k}")
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels(types)
+    axes[0].set_ylim(0, 1.05)
+    axes[0].set_title("Recall@k by query type")
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+
+    # b) sentiment capture
+    cap_labels = [l for l in ("like", "dislike") if f"sentiment_capture_{l}" in out]
+    cap_vals = [out[f"sentiment_capture_{l}"] for l in cap_labels]
+    axes[1].bar(cap_labels, cap_vals, color=["steelblue", "coral"])
+    axes[1].set_ylim(0, 1.05)
+    axes[1].set_title(f"Sentiment capture (margin={margin})")
+    axes[1].grid(True, alpha=0.3)
+
+    # c) neutral bias
+    bias_labels = ["bias mean", "liker frac"]
+    bias_vals = [out.get("neutral_bias_mean", 0.0), out.get("neutral_bias_liker_frac", 0.0)]
+    axes[2].bar(bias_labels, bias_vals, color=["seagreen" if v >= 0 else "crimson" for v in bias_vals])
+    axes[2].axhline(0, color="black", linewidth=0.8)
+    axes[2].set_title("Neutral query bias (+ = liker-favored)")
+    axes[2].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(f"{file_name}.png", dpi=150)
+    plt.close(fig)
+
+
+def plot_results(results: list[dict], meta: list, file_name: str = "", show: bool = True) -> None:
     ks  = sorted(int(k.split("@")[1]) for k in results[0] if k.startswith("recall@"))
     mrr = [r["mrr"] for r in results]
 
@@ -187,15 +304,15 @@ def plot_results(results: list[dict], meta: list, model_name: str = "", show: bo
     ax.set_xticks(meta)
     ax.set_xticklabels([f"{n/1000:.0f}k" if n >= 1000 else str(n) for n in meta])
     ax.set_ylim(0, 1.05)
-    if model_name:
-        ax.set_title(model_name)
+    if file_name:
+        ax.set_title(file_name)
     ax.legend()
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     if show:
         plt.show()
     else:
-        fname = f"{model_name}.png" if model_name else "results.png"
+        fname = f"{file_name}.png" if file_name else "results.png"
         plt.savefig(fname, dpi=150)
         plt.close(fig)
         print(f"  Saved plot: {fname}")

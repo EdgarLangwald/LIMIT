@@ -24,39 +24,27 @@ def _fmt_likes(name: str, items: list[str]) -> str:
 
 def _fmt_dislikes(name: str, items: list[str]) -> str:
     if len(items) == 1:
-        return f"{name} doesn't like {items[0]}."
-    return f"{name} doesn't like {', '.join(items[:-1])} and {items[-1]}."
+        return f"{name} dislikes {items[0]}."
+    return f"{name} dislikes {', '.join(items[:-1])} and {items[-1]}."
 
 
-def build_disjoint_dataset(n: int, m_max: int | None = None, seed: int = 42) -> tuple[list[dict], list[dict], list[int]]:
-    """
-    For each m in 1..m_max, generate a disjoint dataset where n persons each like m unique items.
-    Returns (datasets, qrels_list, m_values).
-    """
+def build_disjoint_dataset(n: int, m: int, seed: int = 42) -> tuple[dict, list[list[int]]]:
+    """Generate a dataset where n persons each like m unique items (disjoint across people)."""
     items_pool, _, _ = load_pool()
-    if m_max is None:
-        m_max = len(items_pool) // n
-    assert n * m_max <= len(items_pool), f"n*m_max={n*m_max} exceeds item pool size ({len(items_pool)})"
+    assert n * m <= len(items_pool), f"n*m={n*m} exceeds item pool size ({len(items_pool)})"
 
     names = generate_names(n, seed)
-    datasets, qrels_list, meta = [], [], []
-
-    for m in range(1, m_max + 1):
-        rng = random.Random(seed)
-        pool = rng.sample(items_pool, n * m)
-        person_items = [pool[i * m:(i + 1) * m] for i in range(n)]
-        corpus  = {name: _fmt_likes(name, items) for name, items in zip(names, person_items)}
-        queries, qrels = {}, []
-        for pidx, (name, items) in enumerate(zip(names, person_items)):
-            for iidx, item in enumerate(items):
-                qid = f"query_{pidx * m + iidx}"
-                queries[qid] = f"Who likes {item}?"
-                qrels.append([pidx])
-        datasets.append({"corpus": corpus, "queries": queries})
-        qrels_list.append(qrels)
-        meta.append(m)
-
-    return datasets, qrels_list, meta
+    rng = random.Random(seed)
+    pool = rng.sample(items_pool, n * m)
+    person_items = [pool[i * m:(i + 1) * m] for i in range(n)]
+    corpus = {name: _fmt_likes(name, items) for name, items in zip(names, person_items)}
+    queries, qrels = {}, []
+    for pidx, (name, items) in enumerate(zip(names, person_items)):
+        for iidx, item in enumerate(items):
+            qid = f"query_{pidx * m + iidx}"
+            queries[qid] = f"Who likes {item}?"
+            qrels.append([pidx])
+    return {"corpus": corpus, "queries": queries}, qrels
 
 
 def _try_greedy_preference(
@@ -113,70 +101,72 @@ def _try_greedy_preference(
 
 def build_preference_dataset(
     n: int,
-    m_max: int | None = None,
+    m: int,
     seed: int = 42,
-) -> tuple[list[dict], list[dict], list[dict], list[int]]:
+) -> tuple[dict, list[list[int]], list[dict]]:
     """
-    Sweep m from 1 to m_max. Each person likes m items and dislikes m other items (no overlap).
-    Every item appears exactly once as a positive and once as a negative across all people.
-    Positive and negative lists are assigned independently via greedy sampling.
+    Each person likes m items and dislikes m other items (no overlap).
+    Every item appears exactly once as liked and once as disliked across all people.
 
-    Each item generates one query "Who has a preference about X?" with two relevant docs
-    (the liker and the disliker). sentiments_list tracks which doc is positive vs negative.
+    Generates 3 queries per item:
+      - "Who likes X?"                  → qrels: [liker_idx]
+      - "Who dislikes X?"               → qrels: [disliker_idx]
+      - "Who has a preference about X?" → qrels: [liker_idx, disliker_idx]
 
-    Returns (datasets, qrels_list, sentiments_list, m_values).
-    sentiments_list[i][qid] = {"pos": name_of_liker, "neg": name_of_disliker}
+    Returns (dataset, qrels, sentiments) where sentiments is a list aligned with
+    queries, each entry: {type, liker_idx, disliker_idx}.
     """
     items_pool, _, _ = load_pool()
-    if m_max is None:
-        m_max = len(items_pool) // n
-    assert n * m_max <= len(items_pool), f"n*m_max={n*m_max} exceeds pool size ({len(items_pool)})"
+    assert n * m <= len(items_pool), f"n*m={n*m} exceeds pool size ({len(items_pool)})"
     assert n >= 2
 
     names = generate_names(n, seed)
-    datasets, qrels_list, sentiments_list, meta = [], [], [], []
+    pos_lists = neg_lists = None
+    success = False
 
-    for m in range(1, m_max + 1):
-        pos_lists = neg_lists = None
-        success = False
+    for attempt in range(5):
+        rng = random.Random(seed + attempt)
+        pos_lists, neg_lists, success = _try_greedy_preference(n, m, items_pool, rng)
+        if success:
+            break
 
-        for attempt in range(5):
-            rng = random.Random(seed + attempt)
-            pos_lists, neg_lists, success = _try_greedy_preference(n, m, items_pool, rng)
-            if success:
-                break
+    n_actual = len(pos_lists)
+    if not success:
+        print(f"Warning: m={m}: could not place last person after 5 attempts, using {n_actual}/{n} people")
 
-        n_actual = len(pos_lists)
-        if not success:
-            print(f"Warning: m={m}: could not place last person after 5 attempts, using {n_actual}/{n} people")
+    actual_names = names[:n_actual]
+    corpus = {
+        name: _fmt_likes(name, pos) + " " + _fmt_dislikes(name, neg)
+        for name, pos, neg in zip(actual_names, pos_lists, neg_lists)
+    }
 
-        actual_names = names[:n_actual]
-        corpus = {
-            name: _fmt_likes(name, pos) + " " + _fmt_dislikes(name, neg)
-            for name, pos, neg in zip(actual_names, pos_lists, neg_lists)
-        }
+    item_to_liker    = {item: name for name, pos in zip(actual_names, pos_lists) for item in pos}
+    item_to_disliker = {item: name for name, neg in zip(actual_names, neg_lists) for item in neg}
+    all_items = [item for pos in pos_lists for item in pos]
 
-        item_to_liker    = {item: name for name, pos in zip(actual_names, pos_lists) for item in pos}
-        item_to_disliker = {item: name for name, neg in zip(actual_names, neg_lists) for item in neg}
-        all_items = [item for pos in pos_lists for item in pos]
+    name_to_idx = {name: i for i, name in enumerate(actual_names)}
+    queries: dict[str, str] = {}
+    qrels: list[list[int]] = []
+    sentiments: list[dict] = []
 
-        name_to_idx = {name: i for i, name in enumerate(actual_names)}
-        queries: dict[str, str] = {}
-        qrels: list[list[int]] = []
-        sentiments: dict[str, dict] = {}
-        for qid_idx, item in enumerate(all_items):
-            qid = f"query_{qid_idx}"
-            liker, disliker = item_to_liker[item], item_to_disliker[item]
-            queries[qid] = f"Who has a preference about {item}?"
-            qrels.append([name_to_idx[liker], name_to_idx[disliker]])
-            sentiments[qid] = {"pos": liker, "neg": disliker}
+    for qid_idx, item in enumerate(all_items):
+        liker, disliker = item_to_liker[item], item_to_disliker[item]
+        liker_idx, disliker_idx = name_to_idx[liker], name_to_idx[disliker]
+        base = qid_idx * 3
 
-        datasets.append({"corpus": corpus, "queries": queries})
-        qrels_list.append(qrels)
-        sentiments_list.append(sentiments)
-        meta.append(m)
+        queries[f"query_{base}"]     = f"Who likes {item}?"
+        qrels.append([liker_idx])
+        sentiments.append({"type": "like", "liker_idx": liker_idx, "disliker_idx": disliker_idx})
 
-    return datasets, qrels_list, sentiments_list, meta
+        queries[f"query_{base + 1}"] = f"Who dislikes {item}?"
+        qrels.append([disliker_idx])
+        sentiments.append({"type": "dislike", "liker_idx": liker_idx, "disliker_idx": disliker_idx})
+
+        queries[f"query_{base + 2}"] = f"Who has a preference about {item}?"
+        qrels.append([liker_idx, disliker_idx])
+        sentiments.append({"type": "neutral", "liker_idx": liker_idx, "disliker_idx": disliker_idx})
+
+    return {"corpus": corpus, "queries": queries}, qrels, sentiments
 
 
 def generate_k_shared_dataset(
@@ -294,11 +284,17 @@ def generate_steiner_dataset(n: int = 1849, seed: int = 42) -> tuple[dict, dict]
 
     return {"corpus": corpus, "queries": queries}, qrels 
 
-# this returns (dataset, qrels)
-# dataset : {"corpus": {...}, "queries": {...}}} dict of two dicts - corpus and queries
-#
-# {...} :  {"person_0": "John Smith likes apples, eggs and horses,
-#           "person_1": "Bettie Stones likes driving, shoes and classical music",
-#               .                               .
-#               .                               .
-#           }
+def increase_param(fn_name: str, param: str, values, **kwargs) -> list:
+    """
+    Call fn_name repeatedly with `param` set to each value in `values`,
+    passing any additional `kwargs` through unchanged each call.
+    Returns a list of the function's return values.
+    """
+    _registry = {
+        "build_disjoint_dataset": build_disjoint_dataset,
+        "build_preference_dataset": build_preference_dataset,
+        "generate_k_shared_dataset": generate_k_shared_dataset,
+        "generate_steiner_dataset": generate_steiner_dataset,
+    }
+    fn = _registry[fn_name]
+    return [fn(**{param: v}, **kwargs) for v in values]
