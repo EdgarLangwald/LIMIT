@@ -182,6 +182,7 @@ def evaluate_preference(
     qrels,              # list[list[int]]
     sentiments,         # list[dict] aligned with qrels; each has {type, liker_idx, disliker_idx}
     ks: list[int] = [1, 2],
+    neutral_ks: list[int] = [2, 5],
     margin: float = 0.05,
     device: str | None = None,
     file_name: str | None = None,
@@ -208,10 +209,10 @@ def evaluate_preference(
     out = {}
 
     # a) recall@k per type
-    for type_name, qs in [("like", like_qs), ("dislike", dislike_qs), ("neutral", neutral_qs)]:
+    for type_name, qs, type_ks in [("like", like_qs, ks), ("dislike", dislike_qs, ks), ("neutral", neutral_qs, neutral_ks)]:
         if not qs:
             continue
-        for k in ks:
+        for k in type_ks:
             recalls = []
             for qi in qs:
                 rel = qrels[qi]
@@ -252,17 +253,19 @@ def evaluate_preference(
 
 
 def _plot_preference_results(out: dict, ks: list[int], margin: float, file_name: str) -> None:
-    types = [t for t in ("like", "dislike", "neutral") if any(f"recall@{k}_{t}" in out for k in ks)]
+    all_ks = sorted({int(k.split("@")[1].split("_")[0]) for k in out if k.startswith("recall@")})
+    types = [t for t in ("like", "dislike", "neutral") if any(f"recall@{k}_{t}" in out for k in all_ks)]
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     fig.suptitle(file_name)
 
     # a) recall@k grouped by query type
     x = np.arange(len(types))
-    width = 0.8 / len(ks)
-    for i, k in enumerate(ks):
-        vals = [out.get(f"recall@{k}_{t}", 0.0) for t in types]
-        axes[0].bar(x + (i - (len(ks) - 1) / 2) * width, vals, width, label=f"recall@{k}")
+    width = 0.8 / len(all_ks)
+    for i, k in enumerate(all_ks):
+        vals = [out.get(f"recall@{k}_{t}", None) for t in types]
+        bars = [v if v is not None else 0.0 for v in vals]
+        axes[0].bar(x + (i - (len(all_ks) - 1) / 2) * width, bars, width, label=f"recall@{k}")
     axes[0].set_xticks(x)
     axes[0].set_xticklabels(types)
     axes[0].set_ylim(0, 1.05)
