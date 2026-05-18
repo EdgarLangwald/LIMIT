@@ -4,9 +4,6 @@ import time
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
-from create_datasets import increase_param
-from name_item_pool import load_pool
-from embed import embed_dataset
 
 def evaluate(
     doc_embs,               # (n_docs, dim), mmap-compatible
@@ -122,39 +119,24 @@ def evaluate(
     return results
 
 
-def eval_embed_distance(
-    n: int = 100,
-    m_max: int | None = None,
+def evaluate_increase_m(
+    mappings,           # list of dicts with "doc_embs", one per m value
+    meta: list[int],    # m values aligned with mappings
     k: int = 5,
-    model_name: str = "model",
-    batch_size: int = 64,
-    device: str | None = None,
+    file_name: str | None = None,
 ) -> dict[int, dict]:
     """
-    For each LOI length m, embed n documents and measure three geometric properties:
+    For each LOI length m, measure four geometric properties of the doc embeddings:
 
-      mean_nn_dist  — average euclidean distance to each doc's nearest neighbour.
-                      Shrinks as embeddings collapse toward one another.
-      topk_gap      — average gap between the k-th and (k+1)-th nearest-neighbour
-                      distances per doc.  A vanishing gap means the k boundary
-                      dissolves and retrieval can no longer distinguish rank k from k+1.
-      anisotropy    — average pairwise cosine similarity (off-diagonal).
-                      Higher values mean embeddings are concentrated in a narrow cone
-                      rather than spread across the sphere.
+      avg_sim    — average pairwise cosine similarity (off-diagonal).
+      mrr_gap    — MRR-weighted sum of the first 10 nearest-neighbour distance gaps:
+                   Σ_{k=1}^{10} (1/k) · mean(dist_rank_{k+1} − dist_rank_k).
+      anisotropy — λ_max / Σλ_i: ratio of the largest eigenvalue of the embedding
+                   covariance to the total variance. Near 1/n = isotropic; near 1 = collapsed.
+      hubness    — skewness of the N_k distribution (how often each doc appears in
+                   others' k-NN lists). High skewness → a few hub points dominate.
     """
-    if m_max is None:
-        m_max = len(load_pool()[0]) // n
-
-    results_raw = increase_param("build_disjoint_dataset", "m", range(1, m_max + 1), n=n)
-    datasets = [r[0] for r in results_raw]
-    meta = list(range(1, m_max + 1))
-    mappings = embed_dataset(datasets, model_name, dataset_name=f"disjoint_n{n}", force=False, device=device, batch_size=batch_size)
-
-    print(f"Model : {model_name}")
-    print(f"n     : {n} documents  |  k = {k}")
-    print(f"{'m':>4}  {'mean_nn_dist':>13}  {'topk_gap':>10}  {'anisotropy':>11}")
-    print("-" * 48)
-
+    K_GAP = 10
     results: dict[int, dict] = {}
     for m, mapping in zip(meta, mappings):
         m_embs = mapping["doc_embs"]
@@ -165,15 +147,74 @@ def eval_embed_distance(
         np.fill_diagonal(dists, np.inf)
         sorted_dists = np.sort(dists, axis=1)
 
-        mean_nn_dist = float(sorted_dists[:, 0].mean())
-        topk_gap     = float(np.mean(sorted_dists[:, k] - sorted_dists[:, k - 1]))
-        anisotropy   = float(cos_sim[~np.eye(n_m, dtype=bool)].mean())
+        avg_sim  = float(cos_sim[~np.eye(n_m, dtype=bool)].mean())
+        mrr_gap  = float(sum(
+            np.mean(sorted_dists[:, ki] - sorted_dists[:, ki - 1]) / ki
+            for ki in range(1, min(K_GAP, n_m - 1) + 1)
+        ))
 
-        results[m] = {"mean_nn_dist": mean_nn_dist, "topk_gap": topk_gap, "anisotropy": anisotropy}
-        r = results[m]
-        print(f"{m:>4}  {r['mean_nn_dist']:>13.4f}  {r['topk_gap']:>10.4f}  {r['anisotropy']:>11.4f}")
+        centered     = m_embs - m_embs.mean(axis=0)
+        eigenvalues  = np.linalg.eigvalsh(centered.T @ centered / n_m)
+        eigenvalues  = np.maximum(eigenvalues, 0.0)
+        anisotropy   = float(eigenvalues.max() / (eigenvalues.sum() + 1e-12))
+
+        knn_indices = np.argsort(dists, axis=1)[:, :k]
+        Nk      = np.bincount(knn_indices.ravel(), minlength=n_m).astype(float)
+        std_Nk  = Nk.std()
+        hubness = float(np.mean((Nk - Nk.mean()) ** 3) / (std_Nk ** 3 + 1e-12))
+
+        results[m] = {
+            "avg_sim": avg_sim,
+            "mrr_gap": mrr_gap,
+            "anisotropy": anisotropy,
+            "hubness": hubness,
+        }
+
+    if file_name:
+        _plot_increase_m(results, file_name)
 
     return results
+
+
+def _plot_increase_m(results: dict[int, dict], file_name: str) -> None:
+    ms         = sorted(results)
+    avg_sim    = [results[m]["avg_sim"]    for m in ms]
+    mrr_gap    = [results[m]["mrr_gap"]    for m in ms]
+    anisotropy = [results[m]["anisotropy"] for m in ms]
+    hubness    = [results[m]["hubness"]    for m in ms]
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    fig.suptitle(file_name)
+
+    axes[0, 0].plot(ms, avg_sim,    marker="o", color="steelblue")
+    axes[0, 0].set_title("Avg pairwise cosine similarity")
+    axes[0, 0].set_ylabel("Cosine similarity")
+    axes[0, 0].set_ylim(0, 1)
+
+    axes[0, 1].plot(ms, mrr_gap,    marker="s", color="darkorange")
+    axes[0, 1].set_title("MRR-weighted NN gap (top 10)")
+    axes[0, 1].set_ylabel("Weighted distance gap")
+    axes[0, 1].set_ylim(0, 1)
+
+    axes[1, 0].plot(ms, anisotropy, marker="^", color="seagreen")
+    axes[1, 0].set_title("Anisotropy (λ_max / Σλ)")
+    axes[1, 0].set_ylabel("Eigenvalue ratio")
+    axes[1, 0].set_ylim(0, 1)
+
+    axes[1, 1].plot(ms, hubness,    marker="D", color="crimson")
+    axes[1, 1].set_title("Hubness (N_k skewness)")
+    axes[1, 1].set_ylabel("Skewness")
+    axes[1, 1].set_ylim(0, 3)
+
+    for ax in axes.flat:
+        ax.set_xlabel("m (items per person)")
+        ax.set_xticks(ms)
+        ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(f"{file_name}.png", dpi=150)
+    plt.close(fig)
+    print(f"  Saved plot: {file_name}.png")
 
 
 def evaluate_preference(
@@ -321,19 +362,3 @@ def plot_results(results: list[dict], meta: list, file_name: str = "", show: boo
         print(f"  Saved plot: {fname}")
 
 
-def plot_embed_distance(results: dict[int, dict]) -> None:
-    ms         = sorted(results)
-    mean_nn    = [results[m]["mean_nn_dist"] for m in ms]
-    topk_gap   = [results[m]["topk_gap"]     for m in ms]
-    anisotropy = [results[m]["anisotropy"]   for m in ms]
-
-    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
-    axes[0].plot(ms, mean_nn,    marker="o", color="steelblue");  axes[0].set_title("Mean nearest-neighbour distance");   axes[0].set_ylabel("Euclidean distance")
-    axes[1].plot(ms, topk_gap,   marker="s", color="darkorange"); axes[1].set_title("Top-k gap (rank k vs k+1)");          axes[1].set_ylabel("Distance gap")
-    axes[2].plot(ms, anisotropy, marker="^", color="seagreen");   axes[2].set_title("Anisotropy (avg pairwise cos-sim)");  axes[2].set_ylabel("Cosine similarity")
-    for ax in axes:
-        ax.set_xlabel("m (items per person)")
-        ax.set_xticks(ms)
-        ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.show()

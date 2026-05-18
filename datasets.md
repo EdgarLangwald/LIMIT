@@ -12,7 +12,7 @@
 
 ---
 
-## 1. `build_disjoint_dataset(n, m_max)`
+## 1. `increase_m(n, m_max)`
 
 **What is tested:** Does recall degrade as a person's profile grows longer? Each person likes exactly `m` items, and `m` sweeps from 1 to `m_max`. The core LOI-length stress test.
 
@@ -32,6 +32,8 @@ for m in 1..m_max:
 All `m` slices use the **same** `n` names (same people, different item assignments at each LOI length). The merged dict has `n * m_max` documents and `n * (1 + 2 + ... + m_max)` queries total.
 
 **Used by:** `eval_item_retrieval` (recall vs. m) and `eval_embed_distance` (geometry vs. m).
+
+
 
 ---
 

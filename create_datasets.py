@@ -28,8 +28,8 @@ def _fmt_dislikes(name: str, items: list[str]) -> str:
     return f"{name} dislikes {', '.join(items[:-1])} and {items[-1]}."
 
 
-def build_disjoint_dataset(n: int, m: int, seed: int = 42) -> tuple[dict, list[list[int]]]:
-    """Generate a dataset where n persons each like m unique items (disjoint across people)."""
+def build_loi_dataset(n: int, m: int, seed: int = 42) -> tuple[dict, list[list[int]]]:
+    """Generate a list-of-items dataset where n persons each like m unique items (disjoint across people)."""
     items_pool, _, _ = load_pool()
     assert n * m <= len(items_pool), f"n*m={n*m} exceeds item pool size ({len(items_pool)})"
 
@@ -169,7 +169,8 @@ def build_preference_dataset(
     return {"corpus": corpus, "queries": queries}, qrels, sentiments
 
 
-def generate_k_shared_dataset(
+# Not used in current experiments — skip when suggesting tests or analysis.
+def build_k_shared_dataset(
     n: int,
     m: int,
     k: int,
@@ -225,7 +226,7 @@ def generate_k_shared_dataset(
     return {"corpus": corpus, "queries": queries}, qrels
 
 
-def generate_steiner_dataset(n: int = 1849, seed: int = 42) -> tuple[dict, dict]:
+def build_steiner_dataset(n: int = 1849, seed: int = 42) -> tuple[dict, dict]:
     """
     Generate a Steiner Triple System dataset with AND pair queries.
     Returns (dataset, qrels).
@@ -291,10 +292,10 @@ def increase_param(fn_name: str, param: str, values, **kwargs) -> list:
     Returns a list of the function's return values.
     """
     _registry = {
-        "build_disjoint_dataset": build_disjoint_dataset,
+        "build_loi_dataset": build_loi_dataset,
         "build_preference_dataset": build_preference_dataset,
-        "generate_k_shared_dataset": generate_k_shared_dataset,
-        "generate_steiner_dataset": generate_steiner_dataset,
+        "build_k_shared_dataset": build_k_shared_dataset,
+        "build_steiner_dataset": build_steiner_dataset,
     }
     fn = _registry[fn_name]
     return [fn(**{param: v}, **kwargs) for v in values]

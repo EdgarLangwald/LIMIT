@@ -1,0 +1,8 @@
+torch
+numpy
+tqdm
+sentence-transformers
+huggingface-hub
+gritlm
+matplotlib
+networkx

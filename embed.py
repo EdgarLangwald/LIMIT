@@ -31,47 +31,51 @@ MODELS: dict[str, dict] = {
     # ~0.5 GB; ModernBERT backbone, strong MTEB for its size (2024)
     "ModernBERT": {
         "hf_id": "Alibaba-NLP/gte-modernbert-base",
-        "query_prefix": "query: ",
+        "query_prefix": "",
     },
     # ~1.2 GB; SOTA-tier small model, strong MTEB for size (2025)
     "Qwen0.6b": {
         "hf_id": "Qwen/Qwen3-Embedding-0.6B",
-        "query_prefix": "query: ",
+        "query_prefix": "Instruct: Retrieve the person whose profile best answers the query.\nQuery:",
     },
     # ~8 GB; near SOTA on MTEB (2025)
     "Qwen4b": {
         "hf_id": "Qwen/Qwen3-Embedding-4B",
-        "query_prefix": "query: ",
+        "query_prefix": "Instruct: Retrieve the person whose profile best answers the query.\nQuery:",
     },
     # ~16 GB; SOTA on MTEB at release (2025)
     "Qwen8b": {
         "hf_id": "Qwen/Qwen3-Embedding-8B",
-        "query_prefix": "query: ",
+        "query_prefix": "Instruct: Retrieve the person whose profile best answers the query.\nQuery:",
     },
     # ~14 GB; was SOTA on MTEB at release (2023)
     "E5_Mistral": {
         "hf_id": "intfloat/e5-mistral-7b-instruct",
-        "query_prefix": "Instruct: Retrieve the person whose profile contains the queried item.\nQuery: ",
+        "query_prefix": "Instruct: Retrieve the person whose profile best answers the query.\nQuery: ",
     },
     # ~14 GB; unified embedding+generation, strong MTEB (2024)
     "GritLM": {
         "hf_id": "GritLM/GritLM-7B",
-        "query_prefix": "<|user|>\nRetrieve the person whose profile contains the queried item.\n<|embed|>\n",
+        "query_prefix": "<|user|>\nRetrieve the person whose profile best answers the query.\n<|embed|>\n",
+        "doc_prefix": "<|embed|>\n",  # GritLM requires this marker even for documents
+        "gritlm_api": True,           # must use gritlm package: SentenceTransformer can't mask instruction tokens during pooling
     },
     # ~16 GB; instruction-following retrieval based on Llama 3.1 (2024)
     "Promptriever": {
         "hf_id": "samaya-ai/promptriever-llama3.1-8b-instruct-v1",
-        "query_prefix": "Retrieve the person whose profile contains the queried item.\n\n",
+        "query_prefix": "query:  ",   # double space per model card
+        "query_suffix": " Retrieve the person whose profile best answers the query.",  # instruction appended AFTER query text
+        "doc_prefix":   "passage:  ", # double space per model card
     },
     # ~16 GB; #1 MTEB late 2024, instruction-following with latent attention layer
     "NV_Embed": {
         "hf_id": "nvidia/NV-Embed-v2",
-        "query_prefix": "Instruct: Retrieve the person whose profile contains the queried item.\nQuery: ",
+        "query_prefix": "Instruct: Retrieve the person whose profile best answers the query.\nQuery: ",
     },
     # ~14 GB; strong MTEB 2024, instruction-following, Qwen2 backbone
     "GTE_Qwen2": {
         "hf_id": "Alibaba-NLP/gte-Qwen2-7B-instruct",
-        "query_prefix": "Instruct: Retrieve the person whose profile contains the queried item.\nQuery: ",
+        "query_prefix": "Instruct: Retrieve the person whose profile best answers the query.\nQuery: ",
     },
     # ~1 GB; MoE architecture, 475M params (305M active), strong for size (2024)
     "Nomic_MoE": {
@@ -177,25 +181,34 @@ def embed_dataset(
 
     if missing:
         import logging
-        logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
-        from sentence_transformers import SentenceTransformer
         from numpy.lib.format import open_memmap
 
         os.makedirs(folder, exist_ok=True)
         model_id         = get_model_id(model_name)
         model_local_path = os.path.join(_DEFAULT_MODELS_DIR, model_name)
         use_device       = device or _device
-        if os.path.isdir(model_local_path):
-            print(f"  model: {model_name} (local)")
-            model = SentenceTransformer(model_local_path, device=use_device)
-        else:
+        is_gritlm        = MODELS[model_name].get("gritlm_api", False)
+        doc_prefix       = MODELS[model_name].get("doc_prefix", "")
+
+        if not os.path.isdir(model_local_path):
             print(f"  model: {model_name} (downloading {model_id})")
             from huggingface_hub import snapshot_download
             snapshot_download(repo_id=model_id, local_dir=model_local_path)
-            model = SentenceTransformer(model_local_path, device=use_device)
+        else:
+            print(f"  model: {model_name} (local)")
 
-        query_prefix = get_query_prefix(model_name)
-        dim = model.get_sentence_embedding_dimension()
+        if is_gritlm:
+            from gritlm import GritLM as _GritLM
+            model = _GritLM(model_local_path, torch_dtype="auto", mode="embedding")
+            dim = np.array(model.encode(["test"], instruction=doc_prefix, batch_size=1), dtype=np.float32).shape[-1]
+        else:
+            logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
+            from sentence_transformers import SentenceTransformer
+            model = SentenceTransformer(model_local_path, device=use_device)
+            dim = model.get_embedding_dimension()
+
+        query_prefix  = get_query_prefix(model_name)
+        query_suffix  = MODELS[model_name].get("query_suffix", "")
 
         for i in missing:
             ds        = ds_list[i]
@@ -222,7 +235,12 @@ def embed_dataset(
                                   initial=doc_start // batch_size,
                                   total=n_doc_batches):
                     batch = doc_texts[start : start + batch_size]
-                    doc_mm[start : start + len(batch)] = embed(batch, model, prefix="", batch_size=batch_size)
+                    if is_gritlm:
+                        embs = np.array(model.encode(batch, instruction=doc_prefix, batch_size=batch_size), dtype=np.float32)
+                        norms = np.linalg.norm(embs, axis=1, keepdims=True)
+                        doc_mm[start : start + len(batch)] = embs / np.maximum(norms, 1e-8)
+                    else:
+                        doc_mm[start : start + len(batch)] = embed(batch, model, prefix=doc_prefix, batch_size=batch_size)
                     _save_progress(p, {"docs_done": False, "doc_start": start + len(batch)})
                 doc_mm.flush()
                 _clear_progress(p)
@@ -238,7 +256,12 @@ def embed_dataset(
                               initial=qry_start // batch_size,
                               total=n_qry_batches):
                 batch = qry_texts[start : start + batch_size]
-                qry_mm[start : start + len(batch)] = embed(batch, model, prefix=query_prefix, batch_size=batch_size)
+                if is_gritlm:
+                    embs = np.array(model.encode(batch, instruction=query_prefix, batch_size=batch_size), dtype=np.float32)
+                    norms = np.linalg.norm(embs, axis=1, keepdims=True)
+                    qry_mm[start : start + len(batch)] = embs / np.maximum(norms, 1e-8)
+                else:
+                    qry_mm[start : start + len(batch)] = embed(batch, model, prefix=query_prefix, suffix=query_suffix, batch_size=batch_size)
                 _save_progress(p, {"docs_done": True, "qry_start": start + len(batch)})
 
             qry_mm.flush()
@@ -258,11 +281,15 @@ def embed(
     texts: list[str],
     model,
     prefix: str = "",
+    suffix: str = "",
     batch_size: int = 64,
 ) -> np.ndarray:
     """Return (len(texts), dim) float32 embeddings using a pre-loaded model."""
-    prefixed = [prefix + t for t in texts] if prefix else texts
+    if prefix or suffix:
+        processed = [prefix + t + suffix for t in texts]
+    else:
+        processed = texts
     return np.array(
-        model.encode(prefixed, batch_size=batch_size, normalize_embeddings=True, show_progress_bar=False),
+        model.encode(processed, batch_size=batch_size, normalize_embeddings=True, show_progress_bar=False),
         dtype=np.float32,
     )

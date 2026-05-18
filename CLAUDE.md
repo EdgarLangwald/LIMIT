@@ -11,13 +11,14 @@ LIMIT paper provides 1848 unique items and >= 1000 american names and surnames. 
 
 **Python modules**
 - `main.py` — Script that gets executed for any experiments from Claude Code or CLI.
-- `create_datasets.py` — all dataset creation functions (`build_disjoint_dataset`, `generate_k_shared_dataset`, `generate_steiner_dataset`)
-- `embed.py` — embedding with transparent MD5 disk cache; `QUERY_PREFIXES` as single source of truth
-- `evaluate.py` — evaluation functions (`eval_item_retrieval`, `eval_embed_distance`, `eval_retrieval_vs_n`) and plot helpers
+- `create_datasets.py` — dataset builders: `build_loi_dataset`, `build_preference_dataset`, `build_steiner_dataset`, `increase_param`; `build_k_shared_dataset` exists but is **not used**
+- `embed.py` — embedding with structured per-dataset disk cache; `MODELS` dict is single source of truth for model IDs and query prefixes
+- `evaluate.py` — evaluation functions (`evaluate`, `eval_embed_distance`, `evaluate_preference`) and plot helpers (`plot_results`, `plot_embed_distance`)
 - `name_item_pool.py` — loads `data/pool.json` (items, first names, surnames) via `load_pool()`
 
 **Notebooks**
 - `main.ipynb` — interactive experimentation and plotting
+- `tests.ipynb` — correctness tests (qrel content, sentiments alignment, incremental accumulation, fixed_rel_size paths, item uniqueness)
 
 **Folders**
 - `data/` — `pool.json` (1848 items, 2738 first names, 1000 surnames)
