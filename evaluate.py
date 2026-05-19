@@ -46,7 +46,7 @@ def evaluate(
             q_end    = min(i + q_bs, n_queries)
             q_vecs   = torch.from_numpy(np.asarray(qry_embs[i:q_end])).to(dev)
             rel_docs = torch.from_numpy(np.asarray(doc_embs[rel_idx_all[i:q_end]])).to(dev)
-            r_scores_all[i:q_end] = torch.einsum('qrd,qd->qr', rel_docs, q_vecs)
+            r_scores_all[i:q_end] = torch.bmm(rel_docs, q_vecs.unsqueeze(-1)).squeeze(-1)
         better_all = torch.zeros((n_queries, fixed_rel_size), dtype=torch.int64, device=dev)
     else:
         r_scores_flat = torch.empty(len(rel_flat), dtype=torch.float32, device=dev)
@@ -75,7 +75,7 @@ def evaluate(
                 q_vecs = torch.from_numpy(np.asarray(qry_embs[i:q_end])).to(dev)
                 s      = q_vecs @ chunk.T                                     # (q_bs, chunk_bs) on GPU
                 if fixed_rel_size is not None:
-                    better_all[i:q_end] += (s[:, None, :] > r_scores_all[i:q_end, :, None]).sum(dim=2)
+                    better_all[i:q_end] += (s[:, None, :] - 1e-6 > r_scores_all[i:q_end, :, None]).sum(dim=2)
                 else:
                     for bi, qi in enumerate(range(i, q_end)):
                         r_s = r_scores_flat[rel_ptr[qi]:rel_ptr[qi + 1]]
@@ -335,14 +335,15 @@ def _plot_preference_results(out: dict, ks: list[int], margin: float, file_name:
     plt.close(fig)
 
 
-def plot_results(results: list[dict], meta: list, file_name: str = "", show: bool = True) -> None:
+def plot_results(results: list[dict], meta: list, file_name: str = "", show: bool = True, show_mrr: bool = True) -> None:
     ks  = sorted(int(k.split("@")[1]) for k in results[0] if k.startswith("recall@"))
-    mrr = [r["mrr"] for r in results]
 
     fig, ax = plt.subplots(figsize=(8, 5))
     for i, k in enumerate(ks):
         ax.plot(meta, [r[f"recall@{k}"] for r in results], marker="os^Dv"[i % 5], label=f"Recall@{k}")
-    ax.plot(meta, mrr, marker="x", linestyle="--", label="MRR")
+    if show_mrr:
+        mrr = [r["mrr"] for r in results]
+        ax.plot(meta, mrr, marker="x", linestyle="--", label="MRR")
     ax.set_xlabel("n")
     ax.set_ylabel("Score")
     ax.set_xticks(meta)
@@ -362,3 +363,42 @@ def plot_results(results: list[dict], meta: list, file_name: str = "", show: boo
         print(f"  Saved plot: {fname}")
 
 
+def plot_mrr_comparison(all_mrr: dict[str, tuple], file_name: str = "mrr_comparison", show: bool = True) -> None:
+    markers = "os^DvP*X"
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for i, (model_name, (meta, mrr_vals)) in enumerate(all_mrr.items()):
+        ax.plot(meta, mrr_vals, marker=markers[i % len(markers)], label=model_name)
+    ax.set_xlabel("n")
+    ax.set_ylabel("MRR")
+    ax.set_xticks(next(iter(all_mrr.values()))[0])
+    ax.set_xticklabels([f"{n/1000:.0f}k" if n >= 1000 else str(n) for n in next(iter(all_mrr.values()))[0]])
+    ax.set_ylim(0, 1.05)
+    ax.set_title(file_name)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    if show:
+        plt.show()
+    else:
+        fname = f"{file_name}.png"
+        plt.savefig(fname, dpi=150)
+        plt.close(fig)
+        print(f"  Saved plot: {fname}")
+
+
+def plot_embed_distance(results: dict[int, dict]) -> None:
+    ms         = sorted(results)
+    mean_nn    = [results[m]["mean_nn_dist"] for m in ms]
+    topk_gap   = [results[m]["topk_gap"]     for m in ms]
+    anisotropy = [results[m]["anisotropy"]   for m in ms]
+
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+    axes[0].plot(ms, mean_nn,    marker="o", color="steelblue");  axes[0].set_title("Mean nearest-neighbour distance");   axes[0].set_ylabel("Euclidean distance")
+    axes[1].plot(ms, topk_gap,   marker="s", color="darkorange"); axes[1].set_title("Top-k gap (rank k vs k+1)");          axes[1].set_ylabel("Distance gap")
+    axes[2].plot(ms, anisotropy, marker="^", color="seagreen");   axes[2].set_title("Anisotropy (avg pairwise cos-sim)");  axes[2].set_ylabel("Cosine similarity")
+    for ax in axes:
+        ax.set_xlabel("m (items per person)")
+        ax.set_xticks(ms)
+        ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
